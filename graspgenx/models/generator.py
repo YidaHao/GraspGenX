@@ -661,7 +661,13 @@ class GraspGenGenerator(nn.Module):
         )
 
         with torch.no_grad():
-            noisy_init = torch.randn([batch_size, self.output_dim], device=device)
+            if "initial_noise" in data:
+                noisy_init = data["initial_noise"].to(
+                    device=device, dtype=data["points"].dtype
+                )
+                noisy_init = noisy_init.reshape(batch_size, self.output_dim).clone()
+            else:
+                noisy_init = torch.randn([batch_size, self.output_dim], device=device)
             noisy_grasps = noisy_init
 
             # Initialize likelihood scores

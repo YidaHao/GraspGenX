@@ -40,3 +40,9 @@ end2end/runs/
 # Ascend: local model weights and torch-npu compiler artifacts
 /ascend/**/*.pth
 /kernel_meta/
+
+# Ascend: generated benchmark, validation, and profiling reports
+/ascend/results/
+/ascend/graspgenx_*.md
+/ascend/*_profile.md
+/fusion_result.json

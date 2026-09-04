@@ -276,12 +276,28 @@ def make_batch(
     input_npz: Path | None = None,
 ):
     rng = np.random.default_rng(1234)
+    input_metadata = {
+        "input_npz": str(input_npz.resolve()) if input_npz is not None else None,
+        "ptv3_scaled_input": False,
+        "input_kappa": None,
+    }
     if input_npz is not None:
-        golden = np.load(input_npz)
-        points = np.asarray(golden["points"], dtype=np.float32)
-        if "initial_noise" not in golden:
-            raise ValueError(f"{input_npz} must contain initial_noise")
-        initial_noise = np.asarray(golden["initial_noise"], dtype=np.float32)
+        with np.load(input_npz) as golden:
+            points = np.asarray(golden["points"], dtype=np.float32)
+            initial_noise = (
+                np.asarray(golden["initial_noise"], dtype=np.float32)
+                if "initial_noise" in golden
+                else None
+            )
+            # PTV3 reference files store the exact tensor presented to the
+            # encoder, after GraspGenX has multiplied the point cloud by kappa.
+            # Undo that scale here because the full generator/discriminator
+            # pipeline applies kappa internally.
+            if "kappa" in golden:
+                input_kappa = float(golden["kappa"])
+                points = points / np.float32(input_kappa)
+                input_metadata["ptv3_scaled_input"] = True
+                input_metadata["input_kappa"] = input_kappa
     else:
         points = rng.normal(0.0, 0.05, size=(point_count, 3)).astype(np.float32)
         points -= points.mean(axis=0, keepdims=True)
@@ -307,7 +323,7 @@ def make_batch(
     batch = collate([item])
     if initial_noise is not None:
         batch["initial_noise"] = torch.from_numpy(initial_noise).to(device)
-    return batch, points, initial_noise
+    return batch, points, initial_noise, input_metadata
 
 
 def stats(values):
@@ -458,7 +474,7 @@ def main():
         if args.single_order and hasattr(module, "order"):
             module.order = ["z"]
     model.grasp_generator.num_grasps_per_object = args.num_grasps
-    batch, points_np, initial_noise_np = make_batch(
+    batch, points_np, initial_noise_np, input_metadata = make_batch(
         cfg, args.gripper, args.assets_dir, device,
         point_count=args.point_count, input_npz=args.input_npz,
     )
@@ -534,6 +550,7 @@ def main():
         "torch": torch.__version__,
         "precision": args.precision,
         "weights": "random" if args.random_weights else "checkpoint",
+        "input": input_metadata,
         "checkpoint_root": str(args.checkpoint_root.resolve()),
         "gripper": args.gripper,
         "point_count": int(len(points_np)),
