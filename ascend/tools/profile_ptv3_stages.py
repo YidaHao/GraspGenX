@@ -67,7 +67,7 @@ DOWNSAMPLE_DEVICE = "cpu"
 FINAL_POOL_DEVICE = "cpu"
 ENCODERS = ("generator", "discriminator")
 WARMUP_RUNS = 1
-PROFILE_RUNS = 3
+PROFILE_RUNS = 20
 CPU_THREADS = 16
 
 GRID_SIZE = 0.01
@@ -159,6 +159,7 @@ def summarize_ms(values: list[float]) -> dict[str, float | int]:
         "mean_ms": statistics.mean(values),
         "median_ms": statistics.median(values),
         "p95_ms": float(np.percentile(values, 95)),
+        "p99_ms": float(np.percentile(values, 99)),
         "min_ms": min(values),
         "max_ms": max(values),
         "std_ms": statistics.pstdev(values),
@@ -301,7 +302,9 @@ def run_partitioned(
     device: torch.device,
     samples: dict[str, list[float]] | None = None,
 ) -> np.ndarray:
-    def stage(name, operation):
+    aggregate_ms = defaultdict(float)
+
+    def stage(name, operation, aggregates=()):
         synchronize(device)
         started = time.perf_counter()
         try:
@@ -310,7 +313,10 @@ def run_partitioned(
         except Exception as exc:
             raise StageFailure(name, exc) from exc
         if samples is not None:
-            samples[name].append((time.perf_counter() - started) * 1000.0)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            samples[name].append(elapsed_ms)
+            for aggregate in aggregates:
+                aggregate_ms[aggregate] += elapsed_ms
         return value
 
     total_started = time.perf_counter()
@@ -339,12 +345,29 @@ def run_partitioned(
                     f"4.encoder_stage_{stage_index}.to_device",
                     lambda point=point: move_point(point, device),
                 )
-        point = stage(
-            f"4.encoder_stage_{stage_index}.blocks",
-            lambda encoder_stage=encoder_stage, point=point: run_stage_blocks(
-                encoder_stage, point
-            ),
-        )
+        for block_name, block in encoder_stage._modules.items():
+            if block_name == "down":
+                continue
+            prefix = f"4.encoder_stage_{stage_index}.{block_name}"
+            summary_prefix = f"4.encoder_stage_{stage_index}.summary"
+            point = stage(
+                f"{prefix}.cpe",
+                lambda block=block, point=point: run_block_cpe(block, point),
+                (f"{summary_prefix}.cpe", f"{summary_prefix}.blocks_total"),
+            )
+            point = stage(
+                f"{prefix}.attention",
+                lambda block=block, point=point: run_block_attention(block, point),
+                (
+                    f"{summary_prefix}.attention",
+                    f"{summary_prefix}.blocks_total",
+                ),
+            )
+            point = stage(
+                f"{prefix}.ffn",
+                lambda block=block, point=point: run_block_ffn(block, point),
+                (f"{summary_prefix}.ffn", f"{summary_prefix}.blocks_total"),
+            )
     if FINAL_POOL_DEVICE == "cpu":
         point = stage(
             "5.final_to_cpu",
@@ -362,6 +385,8 @@ def run_partitioned(
     synchronize(device)
     if samples is not None:
         samples["0.total"].append((time.perf_counter() - total_started) * 1000.0)
+        for name, elapsed_ms in aggregate_ms.items():
+            samples[name].append(elapsed_ms)
     return embedding.detach().float().cpu().numpy()
 
 
@@ -378,10 +403,39 @@ def move_point(point: VanillaPoint, device: torch.device) -> VanillaPoint:
     return point
 
 
+def run_block_cpe(block, point: VanillaPoint) -> VanillaPoint:
+    shortcut = point.feat
+    cpe_out = block.cpe_conv(point.feat, point.grid_coord, point.batch)
+    cpe_out = block.cpe_linear(cpe_out)
+    cpe_out = block.cpe_norm(cpe_out)
+    point.feat = shortcut + cpe_out
+    return point
+
+
+def run_block_attention(block, point: VanillaPoint) -> VanillaPoint:
+    shortcut = point.feat
+    if block.pre_norm:
+        point.feat = block.norm1(point.feat)
+    point = block.attn(point)
+    point.feat = shortcut + block.drop_path(point.feat)
+    return point
+
+
+def run_block_ffn(block, point: VanillaPoint) -> VanillaPoint:
+    shortcut = point.feat
+    if block.pre_norm:
+        point.feat = block.norm2(point.feat)
+    point.feat = shortcut + block.drop_path(block.mlp(point.feat))
+    return point
+
+
 def run_stage_blocks(encoder_stage, point: VanillaPoint) -> VanillaPoint:
-    for name, module in encoder_stage._modules.items():
-        if name != "down":
-            point = module(point)
+    for name, block in encoder_stage._modules.items():
+        if name == "down":
+            continue
+        point = run_block_cpe(block, point)
+        point = run_block_attention(block, point)
+        point = run_block_ffn(block, point)
     return point
 
 
@@ -517,8 +571,10 @@ def main() -> int:
                 print(f"[{status}] {encoder}", flush=True)
                 for stage_name, timing in model_report["stage_timings"].items():
                     print(
-                        f"  {stage_name:26s} median={timing['median_ms']:.3f} ms "
-                        f"p95={timing['p95_ms']:.3f} ms",
+                        f"  {stage_name:42s} mean={timing['mean_ms']:.3f} ms "
+                        f"median={timing['median_ms']:.3f} ms "
+                        f"p95={timing['p95_ms']:.3f} ms "
+                        f"p99={timing['p99_ms']:.3f} ms",
                         flush=True,
                     )
             except Exception as exc:

@@ -171,6 +171,7 @@ def summarize_ms(values: list[float]) -> dict[str, float | int]:
         "mean_ms": statistics.mean(values),
         "median_ms": statistics.median(values),
         "p95_ms": float(np.percentile(values, 95)),
+        "p99_ms": float(np.percentile(values, 99)),
         "min_ms": min(values),
         "max_ms": max(values),
         "std_ms": statistics.pstdev(values),
@@ -378,8 +379,10 @@ def print_case(result: dict) -> None:
         f"rel_l2={accuracy['relative_l2']:.3e} "
         f"cosine={accuracy['cosine']:.8f} "
         f"repeat={repeatability['max_abs']:.3e} "
+        f"mean={latency['mean_ms']:.3f} ms "
         f"median={latency['median_ms']:.3f} ms "
-        f"p95={latency['p95_ms']:.3f} ms",
+        f"p95={latency['p95_ms']:.3f} ms "
+        f"p99={latency['p99_ms']:.3f} ms",
         flush=True,
     )
 
