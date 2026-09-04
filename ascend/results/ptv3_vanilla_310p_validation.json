@@ -1,0 +1,242 @@
+{
+  "contract": {
+    "implementation": "graspgenx.models.ptv3.ptv3_vanilla.PointTransformerV3Vanilla",
+    "device": "cpu",
+    "serialization_device": "cpu",
+    "downsample_device": "cpu",
+    "final_pool_device": "cpu",
+    "precision": "fp32",
+    "point_counts": [
+      64,
+      2048,
+      3500
+    ],
+    "encoders": [
+      "generator",
+      "discriminator"
+    ],
+    "grid_size": 0.01,
+    "enable_flash": false,
+    "shuffle_orders": false,
+    "warmup_runs": 3,
+    "measured_runs": 20,
+    "repeat_checks": 3,
+    "gates": {
+      "max_abs": 0.015,
+      "mean_abs": 0.003,
+      "relative_l2": 0.005,
+      "cosine": 0.99999,
+      "repeat_max_abs": 1e-05
+    }
+  },
+  "paths": {
+    "repository": "/root/Workspace/GraspgenX/GraspGenX",
+    "baseline_dir": "/root/Workspace/GraspgenX/GraspGenX/ascend/baselines/ptv3-cuda-fp32-eager",
+    "result": "/root/Workspace/GraspgenX/GraspGenX/ascend/results/ptv3_vanilla_310p_validation.json"
+  },
+  "baseline_sha256": {
+    "generator_ptv3_state.pth": "f017bc75315737a5eb088badb18dfebdd719483f669b694e113e47f45783b4e6",
+    "discriminator_ptv3_state.pth": "0ed58567048bfde97b716d04d85dc58c487b27ad103a5fc8714ca86a7d756dd1",
+    "reference_n64.npz": "e033f95d973202ed4c8c54d4d6c30078389f33a2e1d581d648425eea3a139675",
+    "reference_n2048.npz": "e0d901235e755404522ad86bb9a651b7d0c93bc9dc6851b0178686be194d14ff",
+    "reference_n3500.npz": "9df08f2e7b06631dfdd721356691b178409c4d5e11bd553e65fe68eaac38adca"
+  },
+  "environment": {
+    "torch": "2.5.1",
+    "torch_npu": "2.5.1",
+    "device_name": "310P host CPU"
+  },
+  "results": [
+    {
+      "encoder": "generator",
+      "point_count": 64,
+      "accuracy": {
+        "shape_match": true,
+        "finite": true,
+        "max_abs": 0.0026317983865737915,
+        "mean_abs": 0.0005796407762090894,
+        "rmse": 0.0007569198255731664,
+        "relative_l2": 0.0009993496857287022,
+        "cosine": 0.9999995015413904,
+        "passed": true
+      },
+      "repeatability": {
+        "checks": 3,
+        "max_abs": 0.0,
+        "passed": true
+      },
+      "latency": {
+        "count": 20,
+        "mean_ms": 259.10491939866915,
+        "median_ms": 257.0444685406983,
+        "p95_ms": 273.9910523756407,
+        "min_ms": 253.2254580873996,
+        "max_ms": 287.9906790331006,
+        "std_ms": 7.879594871717637
+      },
+      "performance_target_ms": 150.0,
+      "performance_target_passed": false,
+      "passed": true
+    },
+    {
+      "encoder": "generator",
+      "point_count": 2048,
+      "accuracy": {
+        "shape_match": true,
+        "finite": true,
+        "max_abs": 0.0019572973251342773,
+        "mean_abs": 0.00045394264452625066,
+        "rmse": 0.0005684801212505846,
+        "relative_l2": 0.0006821636351589722,
+        "cosine": 0.9999997773056862,
+        "passed": true
+      },
+      "repeatability": {
+        "checks": 3,
+        "max_abs": 0.0,
+        "passed": true
+      },
+      "latency": {
+        "count": 20,
+        "mean_ms": 396.4368822402321,
+        "median_ms": 387.69062445499003,
+        "p95_ms": 453.3816547016613,
+        "min_ms": 380.6787689682096,
+        "max_ms": 477.03108191490173,
+        "std_ms": 24.18626509934299
+      },
+      "performance_target_ms": 150.0,
+      "performance_target_passed": false,
+      "passed": true
+    },
+    {
+      "encoder": "generator",
+      "point_count": 3500,
+      "accuracy": {
+        "shape_match": true,
+        "finite": true,
+        "max_abs": 0.002074599266052246,
+        "mean_abs": 0.000588952025736944,
+        "rmse": 0.0007452384029628672,
+        "relative_l2": 0.0008557056690431232,
+        "cosine": 0.9999996340183908,
+        "passed": true
+      },
+      "repeatability": {
+        "checks": 3,
+        "max_abs": 0.0,
+        "passed": true
+      },
+      "latency": {
+        "count": 20,
+        "mean_ms": 516.3990322500467,
+        "median_ms": 505.9851820115,
+        "p95_ms": 555.2939486806282,
+        "min_ms": 491.4489039219916,
+        "max_ms": 638.9597619418055,
+        "std_ms": 33.317029029132314
+      },
+      "performance_target_ms": 150.0,
+      "performance_target_passed": false,
+      "passed": true
+    },
+    {
+      "encoder": "discriminator",
+      "point_count": 64,
+      "accuracy": {
+        "shape_match": true,
+        "finite": true,
+        "max_abs": 0.005380153656005859,
+        "mean_abs": 0.0013265140231695227,
+        "rmse": 0.0016644922480639663,
+        "relative_l2": 0.0020987798311456578,
+        "cosine": 0.9999978191083273,
+        "passed": true
+      },
+      "repeatability": {
+        "checks": 3,
+        "max_abs": 0.0,
+        "passed": true
+      },
+      "latency": {
+        "count": 20,
+        "mean_ms": 289.85844197450206,
+        "median_ms": 287.8899024799466,
+        "p95_ms": 296.0496848798357,
+        "min_ms": 286.3665611948818,
+        "max_ms": 315.88984187692404,
+        "std_ms": 6.347761867591187
+      },
+      "performance_target_ms": 150.0,
+      "performance_target_passed": false,
+      "passed": true
+    },
+    {
+      "encoder": "discriminator",
+      "point_count": 2048,
+      "accuracy": {
+        "shape_match": true,
+        "finite": true,
+        "max_abs": 0.005519866943359375,
+        "mean_abs": 0.0011402295212974423,
+        "rmse": 0.001451245856675627,
+        "relative_l2": 0.001781735830004771,
+        "cosine": 0.9999984336257299,
+        "passed": true
+      },
+      "repeatability": {
+        "checks": 3,
+        "max_abs": 0.0,
+        "passed": true
+      },
+      "latency": {
+        "count": 20,
+        "mean_ms": 404.9493534723297,
+        "median_ms": 397.62688952032477,
+        "p95_ms": 428.4835761645809,
+        "min_ms": 391.4147401228547,
+        "max_ms": 430.408941116184,
+        "std_ms": 13.582529884000483
+      },
+      "performance_target_ms": 150.0,
+      "performance_target_passed": false,
+      "passed": true
+    },
+    {
+      "encoder": "discriminator",
+      "point_count": 3500,
+      "accuracy": {
+        "shape_match": true,
+        "finite": true,
+        "max_abs": 0.010176777839660645,
+        "mean_abs": 0.0022484152505057864,
+        "rmse": 0.002873720827672366,
+        "relative_l2": 0.0031904018555465445,
+        "cosine": 0.999994986974675,
+        "passed": true
+      },
+      "repeatability": {
+        "checks": 3,
+        "max_abs": 0.0,
+        "passed": true
+      },
+      "latency": {
+        "count": 20,
+        "mean_ms": 1437.7938328078017,
+        "median_ms": 1432.2436954826117,
+        "p95_ms": 1468.3342714211904,
+        "min_ms": 1406.9901190232486,
+        "max_ms": 1507.0410049520433,
+        "std_ms": 26.788995216402135
+      },
+      "performance_target_ms": 150.0,
+      "performance_target_passed": false,
+      "passed": true
+    }
+  ],
+  "failures": [],
+  "summary": {
+    "correctness": "PASS",
+    "performance_target": "FAIL"
+  }
+}

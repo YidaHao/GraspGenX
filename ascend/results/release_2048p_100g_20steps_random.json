@@ -1,0 +1,355 @@
+{
+  "environment": {
+    "device": "Ascend310P1",
+    "torch": "2.5.1",
+    "cpu_threads": 16,
+    "precision": "fp32",
+    "weights": "random",
+    "ptv3_device": "cpu",
+    "dense_heads_device": "npu:0"
+  },
+  "workload": {
+    "point_count": 2048,
+    "num_grasps": 100,
+    "diffusion_steps": 20,
+    "grid_size": 0.01,
+    "kappa": 3.27,
+    "ptv3_enable_flash": false,
+    "ptv3_shuffle_orders": false
+  },
+  "call_counts_per_request": {
+    "generator.ptv3_encoder": 1,
+    "generator.diffusion_head": 20,
+    "discriminator.ptv3_encoder": 1,
+    "discriminator.head": 1
+  },
+  "setup_s": 36.776421366026625,
+  "warmup": {
+    "count": 1,
+    "mean_ms": 103482.23704006523,
+    "median_ms": 103482.23704006523,
+    "p95_ms": 103482.23704006523,
+    "min_ms": 103482.23704006523,
+    "max_ms": 103482.23704006523
+  },
+  "profiled_stages": {
+    "discriminator.batch_mapping": {
+      "count": 3,
+      "mean_ms": 1.3463336508721113,
+      "median_ms": 1.3525751419365406,
+      "p95_ms": 1.4527485240250826,
+      "min_ms": 1.222546910867095,
+      "max_ms": 1.4638788998126984
+    },
+    "discriminator.conditioning": {
+      "count": 3,
+      "mean_ms": 0.29447566096981365,
+      "median_ms": 0.29331305995583534,
+      "p95_ms": 0.32441432122141123,
+      "min_ms": 0.2622439060360193,
+      "max_ms": 0.3278700169175863
+    },
+    "discriminator.embedding_to_device": {
+      "count": 3,
+      "mean_ms": 0.28299920571347076,
+      "median_ms": 0.25633187033236027,
+      "p95_ms": 0.3446695860475301,
+      "min_ms": 0.2381808590143919,
+      "max_ms": 0.35448488779366016
+    },
+    "discriminator.gripper_encoder": {
+      "count": 3,
+      "mean_ms": 2.1480227199693522,
+      "median_ms": 1.904329052194953,
+      "p95_ms": 2.6341625256463885,
+      "min_ms": 1.8244839739054441,
+      "max_ms": 2.715255133807659
+    },
+    "discriminator.gripper_repeat": {
+      "count": 3,
+      "mean_ms": 0.25161899005373317,
+      "median_ms": 0.25466596707701683,
+      "p95_ms": 0.2561897970736027,
+      "min_ms": 0.24383189156651497,
+      "max_ms": 0.25635911151766777
+    },
+    "discriminator.head": {
+      "count": 3,
+      "mean_ms": 1.8859092767039936,
+      "median_ms": 1.7327119130641222,
+      "p95_ms": 2.3024172987788916,
+      "min_ms": 1.5592980198562145,
+      "max_ms": 2.3657178971916437
+    },
+    "discriminator.object_repeat": {
+      "count": 3,
+      "mean_ms": 0.29015230635801953,
+      "median_ms": 0.2842231187969446,
+      "p95_ms": 0.3273490583524108,
+      "min_ms": 0.25409297086298466,
+      "max_ms": 0.33214082941412926
+    },
+    "discriminator.points_to_cpu": {
+      "count": 3,
+      "mean_ms": 0.3300576936453581,
+      "median_ms": 0.33456296660006046,
+      "p95_ms": 0.33967236522585154,
+      "min_ms": 0.31537003815174103,
+      "max_ms": 0.34024007618427277
+    },
+    "discriminator.pose_conversion": {
+      "count": 3,
+      "mean_ms": 12.260071312387785,
+      "median_ms": 11.764941038563848,
+      "p95_ms": 14.500472997315228,
+      "min_ms": 10.210851905867457,
+      "max_ms": 14.804420992732048
+    },
+    "discriminator.ptv3_encoder": {
+      "count": 3,
+      "mean_ms": 3264.1031412252537,
+      "median_ms": 2930.8600078802556,
+      "p95_ms": 3840.9583984641354,
+      "min_ms": 2919.3689739331603,
+      "max_ms": 3942.0804418623447
+    },
+    "discriminator.ptv3_format": {
+      "count": 3,
+      "mean_ms": 0.3675672536094983,
+      "median_ms": 0.37302705459296703,
+      "p95_ms": 0.3796139732003212,
+      "min_ms": 0.3493288531899452,
+      "max_ms": 0.38034585304558277
+    },
+    "discriminator.sample_encoder": {
+      "count": 3,
+      "mean_ms": 1.4431843689332406,
+      "median_ms": 1.4234362170100212,
+      "p95_ms": 1.696463511325419,
+      "min_ms": 1.1793170124292374,
+      "max_ms": 1.7267998773604631
+    },
+    "discriminator.scale": {
+      "count": 3,
+      "mean_ms": 0.3601099985341231,
+      "median_ms": 0.3566720988601446,
+      "p95_ms": 0.3693061415106058,
+      "min_ms": 0.35294797271490097,
+      "max_ms": 0.3707099240273237
+    },
+    "discriminator.sigmoid": {
+      "count": 3,
+      "mean_ms": 0.21976069547235966,
+      "median_ms": 0.21445704624056816,
+      "p95_ms": 0.23468362633138895,
+      "min_ms": 0.20789401605725288,
+      "max_ms": 0.23693102411925793
+    },
+    "discriminator.total": {
+      "count": 3,
+      "mean_ms": 3286.851249402389,
+      "median_ms": 2950.3215420991182,
+      "p95_ms": 3867.191093484871,
+      "min_ms": 2941.1667180247605,
+      "max_ms": 3969.065488083288
+    },
+    "end_to_end_profiled": {
+      "count": 3,
+      "mean_ms": 6898.009123591085,
+      "median_ms": 6613.097779918462,
+      "p95_ms": 7503.596658189781,
+      "min_ms": 6478.388612857088,
+      "max_ms": 7602.540977997705
+    },
+    "generator.batch_mapping": {
+      "count": 3,
+      "mean_ms": 1.64657326725622,
+      "median_ms": 1.5597918536514044,
+      "p95_ms": 1.8454770790413022,
+      "min_ms": 1.5027080662548542,
+      "max_ms": 1.877219881862402
+    },
+    "generator.conditioning": {
+      "count": 3,
+      "mean_ms": 0.2938246664901574,
+      "median_ms": 0.29810494743287563,
+      "p95_ms": 0.3104791510850191,
+      "min_ms": 0.27151498943567276,
+      "max_ms": 0.31185406260192394
+    },
+    "generator.diffusion_head": {
+      "count": 3,
+      "mean_ms": 300.2659402942906,
+      "median_ms": 298.6497185193002,
+      "p95_ms": 303.4640521509573,
+      "min_ms": 298.14912425354123,
+      "max_ms": 303.9989781100303
+    },
+    "generator.embedding_to_device": {
+      "count": 3,
+      "mean_ms": 0.2263840287923813,
+      "median_ms": 0.22177398204803467,
+      "p95_ms": 0.23574389051645994,
+      "min_ms": 0.220082001760602,
+      "max_ms": 0.2372961025685072
+    },
+    "generator.gripper_encoder": {
+      "count": 3,
+      "mean_ms": 2.370240011562904,
+      "median_ms": 2.1730579901486635,
+      "p95_ms": 2.7619353029876943,
+      "min_ms": 2.1102959290146828,
+      "max_ms": 2.827366115525365
+    },
+    "generator.gripper_repeat": {
+      "count": 3,
+      "mean_ms": 0.26310359438260394,
+      "median_ms": 0.26206206530332565,
+      "p95_ms": 0.27710904832929373,
+      "min_ms": 0.24846778251230717,
+      "max_ms": 0.27878093533217907
+    },
+    "generator.history_init": {
+      "count": 3,
+      "mean_ms": 0.2541193583359321,
+      "median_ms": 0.25958800688385963,
+      "p95_ms": 0.26837748009711504,
+      "min_ms": 0.23341597989201546,
+      "max_ms": 0.2693540882319212
+    },
+    "generator.history_store": {
+      "count": 3,
+      "mean_ms": 4.601564180726807,
+      "median_ms": 4.608545685186982,
+      "p95_ms": 4.611475788988173,
+      "min_ms": 4.584345500916243,
+      "max_ms": 4.611801356077194
+    },
+    "generator.likelihood": {
+      "count": 3,
+      "mean_ms": 99.41435387978952,
+      "median_ms": 99.09271285869181,
+      "p95_ms": 100.17481844406575,
+      "min_ms": 98.85529638268054,
+      "max_ms": 100.29505239799619
+    },
+    "generator.likelihood_init": {
+      "count": 3,
+      "mean_ms": 0.28215767815709114,
+      "median_ms": 0.2921929117292166,
+      "p95_ms": 0.29427832923829556,
+      "min_ms": 0.25977008044719696,
+      "max_ms": 0.2945100422948599
+    },
+    "generator.noise_init": {
+      "count": 3,
+      "mean_ms": 0.18563664828737578,
+      "median_ms": 0.1889350824058056,
+      "p95_ms": 0.19411530811339617,
+      "min_ms": 0.17328397370874882,
+      "max_ms": 0.1946908887475729
+    },
+    "generator.object_repeat": {
+      "count": 3,
+      "mean_ms": 0.2965070307254791,
+      "median_ms": 0.29042200185358524,
+      "p95_ms": 0.32621147111058235,
+      "min_ms": 0.2689110115170479,
+      "max_ms": 0.33018807880580425
+    },
+    "generator.points_to_cpu": {
+      "count": 3,
+      "mean_ms": 0.3663256453971068,
+      "median_ms": 0.39995484985411167,
+      "p95_ms": 0.5004796432331204,
+      "min_ms": 0.18737302161753178,
+      "max_ms": 0.511649064719677
+    },
+    "generator.pose_conversion": {
+      "count": 3,
+      "mean_ms": 187.93098473300537,
+      "median_ms": 187.46157549321651,
+      "p95_ms": 190.68360275123268,
+      "min_ms": 185.28977292589843,
+      "max_ms": 191.04160577990115
+    },
+    "generator.ptv3_encoder": {
+      "count": 3,
+      "mean_ms": 2893.0824019480497,
+      "median_ms": 2919.480894925073,
+      "p95_ms": 2946.950570703484,
+      "min_ms": 2809.763554017991,
+      "max_ms": 2950.0027569010854
+    },
+    "generator.ptv3_format": {
+      "count": 3,
+      "mean_ms": 0.4068823376049598,
+      "median_ms": 0.4053199663758278,
+      "p95_ms": 0.4676415119320154,
+      "min_ms": 0.3407609183341265,
+      "max_ms": 0.47456612810492516
+    },
+    "generator.sample_update": {
+      "count": 3,
+      "mean_ms": 4.839942945788304,
+      "median_ms": 4.825444892048836,
+      "p95_ms": 4.890113789588213,
+      "min_ms": 4.7970847226679325,
+      "max_ms": 4.897299222648144
+    },
+    "generator.scale": {
+      "count": 3,
+      "mean_ms": 0.4817876809587081,
+      "median_ms": 0.36383396945893764,
+      "p95_ms": 0.7346682250499725,
+      "min_ms": 0.30565704219043255,
+      "max_ms": 0.7758720312267542
+    },
+    "generator.scheduler_setup": {
+      "count": 3,
+      "mean_ms": 0.5719806843747696,
+      "median_ms": 0.6200890056788921,
+      "p95_ms": 0.6205110345035791,
+      "min_ms": 0.4752951208502054,
+      "max_ms": 0.620557926595211
+    },
+    "generator.scheduler_step": {
+      "count": 3,
+      "mean_ms": 98.99529170555373,
+      "median_ms": 99.06234918162227,
+      "p95_ms": 99.32253120932728,
+      "min_ms": 98.5720856115222,
+      "max_ms": 99.35144032351673
+    },
+    "generator.total": {
+      "count": 3,
+      "mean_ms": 3611.14806534412,
+      "median_ms": 3633.4591871127486,
+      "p95_ms": 3659.8381113726646,
+      "min_ms": 3537.215905962512,
+      "max_ms": 3662.7691029570997
+    }
+  },
+  "end_to_end_unprofiled": {
+    "count": 5,
+    "mean_ms": 6571.996510587633,
+    "median_ms": 6545.528220012784,
+    "p95_ms": 6723.359570419416,
+    "min_ms": 6443.784383125603,
+    "max_ms": 6746.495326049626
+  },
+  "output": {
+    "grasps_shape": [
+      1,
+      100,
+      4,
+      4
+    ],
+    "confidence_shape": [
+      1,
+      100,
+      1
+    ],
+    "finite": true
+  }
+}

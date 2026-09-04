@@ -1,0 +1,23 @@
+# Deployment-relevant fields from the official GraspGenX release discriminator config.
+discriminator:
+  checkpoint: null
+  checkpoint_object_encoder_pretrained: null
+  object_backbone: ptv3vanilla
+  gripper_backbone: sweep_volume_v2
+  pointnet_version: v2
+  num_embed_dim: 256
+  num_object_dim: 512
+  num_gripper_dim: 512
+  grasp_repr: r3_so3
+  pose_repr: mlp
+  topk_ratio: 1.0
+  kappa: 3.27
+  ptv3:
+    grid_size: 0.01
+  ptv3vanilla:
+    grid_size: 0.01
+    output_dim: 512
+    enable_flash: false
+eval:
+  gen_checkpoint: ""
+  dis_checkpoint: ""

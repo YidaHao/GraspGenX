@@ -1,0 +1,82 @@
+{
+  "device": "npu:0",
+  "torch": "2.5.1",
+  "precision": "fp32",
+  "weights": "random",
+  "checkpoint_root": "/root/Workspace/GraspgenX/GraspGenX/ascend/sample-data/release-config",
+  "gripper": "parallel_2f_v1_1014",
+  "point_count": 2048,
+  "num_grasps": 100,
+  "ptv3_encoder_device": "cpu",
+  "cpu_threads": 16,
+  "diffusion_device": "npu:0",
+  "diffusion_eval_steps": 20,
+  "grasp_output_shape": [
+    1,
+    100,
+    4,
+    4
+  ],
+  "confidence_output_shape": [
+    1,
+    100,
+    1
+  ],
+  "outputs_finite": true,
+  "load_and_setup_s": 40.941418097005226,
+  "warmup": {
+    "count": 1,
+    "mean_s": 93.37459623999894,
+    "median_s": 93.37459623999894,
+    "p95_s": 93.37459623999894,
+    "min_s": 93.37459623999894,
+    "max_s": 93.37459623999894,
+    "std_s": 0.0,
+    "hz": 0.010709550994252432
+  },
+  "warmup_samples_s": [
+    93.37459623999894
+  ],
+  "stable_window_requested_s": 30.0,
+  "stable_window_measured_s": 34.443266746005975,
+  "stable_runs": {
+    "count": 5,
+    "mean_s": 6.887330558011309,
+    "median_s": 6.840390524012037,
+    "p95_s": 7.038806086685509,
+    "min_s": 6.786767015932128,
+    "max_s": 7.06123178510461,
+    "std_s": 0.10406528463483511,
+    "hz": 0.1451941345891704
+  },
+  "stable_samples_s": [
+    6.799160171998665,
+    7.06123178510461,
+    6.949103293009102,
+    6.786767015932128,
+    6.840390524012037
+  ],
+  "failures": [],
+  "encoder_bridge_timings": {
+    "generator": {
+      "count": 5,
+      "mean_s": 3.104334418964572,
+      "median_s": 3.078531416016631,
+      "p95_s": 3.205406810925342,
+      "min_s": 3.0421193150104955,
+      "max_s": 3.2348324499325827,
+      "std_s": 0.06709846891927522,
+      "hz": 0.32213024276345287
+    },
+    "discriminator": {
+      "count": 5,
+      "mean_s": 3.0648179021896795,
+      "median_s": 3.0557730580912903,
+      "p95_s": 3.107304946379736,
+      "min_s": 3.029833405977115,
+      "max_s": 3.1156121069798246,
+      "std_s": 0.02908002230362882,
+      "hz": 0.32628365922998015
+    }
+  }
+}
