@@ -510,6 +510,11 @@ def main():
         sync(device)
         warmup_values.append(time.perf_counter() - started)
     grasp_shape, confidence_shape = validate_output(out, args.num_grasps)
+    print(
+        f"Warmup complete: {len(warmup_values)} run(s), "
+        f"last={warmup_values[-1]:.3f}s",
+        flush=True,
+    )
 
     if args.save_npz is not None:
         args.save_npz.parent.mkdir(parents=True, exist_ok=True)

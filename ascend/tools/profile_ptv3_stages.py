@@ -69,6 +69,7 @@ ENCODERS = ("generator", "discriminator")
 WARMUP_RUNS = 1
 PROFILE_RUNS = 20
 CPU_THREADS = 16
+RANKING_TABLE_LIMIT = 100
 
 GRID_SIZE = 0.01
 KAPPA = 3.27
@@ -154,6 +155,17 @@ def synchronize(device: torch.device) -> None:
 
 
 def summarize_ms(values: list[float]) -> dict[str, float | int]:
+    if not values:
+        return {
+            "count": 0,
+            "mean_ms": 0.0,
+            "median_ms": 0.0,
+            "p95_ms": 0.0,
+            "p99_ms": 0.0,
+            "min_ms": 0.0,
+            "max_ms": 0.0,
+            "std_ms": 0.0,
+        }
     return {
         "count": len(values),
         "mean_ms": statistics.mean(values),
@@ -164,6 +176,215 @@ def summarize_ms(values: list[float]) -> dict[str, float | int]:
         "max_ms": max(values),
         "std_ms": statistics.pstdev(values),
     }
+
+
+OPTIMIZATION_DIRECTIONS = {
+    "attention": "优化 QKV/softmax/gather，避免不必要的 FP32 upcast",
+    "cpe": "缓存邻接索引，融合 hash-conv/linear/norm",
+    "ffn": "融合 Linear-GELU-Linear；当前优先级较低",
+    "serialization": "缓存四路 code/order/inverse，避免重复排序",
+    "downsample": "缓存 unique/cluster/argsort 结果，减少动态索引重建",
+    "embedding": "优化 stem 的 hash lookup 与加权聚合",
+    "transfer": "合并 CPU/NPU 往返，静态索引一次性传输",
+    "pooling": "使用固定 batch reduction；当前优先级较低",
+    "projection": "不是当前热点，暂不优先优化",
+    "other": "保留到下一轮 stage 诊断",
+}
+
+
+def stage_category(stage_name: str) -> str:
+    if stage_name == "1.serialization":
+        return "serialization"
+    if stage_name == "3.embedding":
+        return "embedding"
+    if stage_name.endswith(".to_cpu") or stage_name.endswith(".to_device"):
+        return "transfer"
+    if stage_name.endswith(".down"):
+        return "downsample"
+    if stage_name == "6.global_mean_pooling":
+        return "pooling"
+    if stage_name == "7.projection":
+        return "projection"
+    if stage_name.endswith(".cpe"):
+        return "cpe"
+    if stage_name.endswith(".attention"):
+        return "attention"
+    if stage_name.endswith(".ffn"):
+        return "ffn"
+    return "other"
+
+
+def is_leaf_stage(stage_name: str) -> bool:
+    return stage_name != "0.total" and ".summary." not in stage_name
+
+
+def add_sample_lists(left: list[float], right: list[float]) -> list[float]:
+    if not left:
+        return list(right)
+    if not right:
+        return list(left)
+    if len(left) != len(right):
+        raise ValueError(f"cannot combine samples with lengths {len(left)} and {len(right)}")
+    return [a + b for a, b in zip(left, right)]
+
+
+def build_optimization_ranking(
+    timing_samples: dict[str, dict[str, list[float]]],
+) -> dict[str, list[dict]]:
+    """Build exact rankings from the per-run samples, not summed percentiles."""
+    encoders = list(timing_samples)
+    stage_names = sorted(
+        {
+            name
+            for encoder_samples in timing_samples.values()
+            for name in encoder_samples
+            if is_leaf_stage(name)
+        }
+    )
+    stage_rows = []
+    for stage_name in stage_names:
+        per_encoder = {
+            encoder: summarize_ms(timing_samples[encoder].get(stage_name, []))
+            for encoder in encoders
+        }
+        combined_samples = add_sample_lists(
+            timing_samples[encoders[0]].get(stage_name, []),
+            timing_samples[encoders[1]].get(stage_name, []),
+        )
+        combined = summarize_ms(combined_samples)
+        stage_rows.append(
+            {
+                "stage": stage_name,
+                "category": stage_category(stage_name),
+                "generator": per_encoder.get("generator"),
+                "discriminator": per_encoder.get("discriminator"),
+                "combined": combined,
+            }
+        )
+    stage_rows.sort(key=lambda row: row["combined"]["median_ms"], reverse=True)
+    total_median = sum(row["combined"]["median_ms"] for row in stage_rows)
+    for rank, row in enumerate(stage_rows, start=1):
+        row["rank"] = rank
+        row["median_share_percent"] = (
+            100.0 * row["combined"]["median_ms"] / total_median
+            if total_median
+            else 0.0
+        )
+
+    category_samples: dict[str, dict[str, list[list[float]]]] = {
+        encoder: defaultdict(list) for encoder in encoders
+    }
+    for encoder in encoders:
+        for stage_name, samples in timing_samples[encoder].items():
+            if is_leaf_stage(stage_name):
+                category_samples[encoder][stage_category(stage_name)].append(samples)
+
+    category_rows = []
+    for category in sorted(
+        {
+            category
+            for encoder_categories in category_samples.values()
+            for category in encoder_categories
+        }
+    ):
+        per_encoder = {}
+        for encoder in encoders:
+            category_runs = category_samples[encoder].get(category, [])
+            if category_runs:
+                per_encoder[encoder] = summarize_ms(
+                    [
+                        sum(run[index] for run in category_runs)
+                        for index in range(PROFILE_RUNS)
+                    ]
+                )
+            else:
+                per_encoder[encoder] = summarize_ms([])
+        combined_runs = add_sample_lists(
+            [
+                sum(
+                    run[index]
+                    for run in category_samples[encoders[0]].get(category, [])
+                )
+                for index in range(PROFILE_RUNS)
+            ],
+            [
+                sum(
+                    run[index]
+                    for run in category_samples[encoders[1]].get(category, [])
+                )
+                for index in range(PROFILE_RUNS)
+            ],
+        )
+        category_rows.append(
+            {
+                "category": category,
+                "generator": per_encoder["generator"],
+                "discriminator": per_encoder["discriminator"],
+                "combined": summarize_ms(combined_runs),
+                "direction": OPTIMIZATION_DIRECTIONS[category],
+            }
+        )
+    category_rows.sort(key=lambda row: row["combined"]["median_ms"], reverse=True)
+    category_total = sum(row["combined"]["median_ms"] for row in category_rows)
+    for rank, row in enumerate(category_rows, start=1):
+        row["rank"] = rank
+        row["median_share_percent"] = (
+            100.0 * row["combined"]["median_ms"] / category_total
+            if category_total
+            else 0.0
+        )
+    return {
+        "stage_rows": stage_rows,
+        "category_rows": category_rows,
+        "sort_key": "combined.median_ms descending",
+        "stage_table_limit": RANKING_TABLE_LIMIT,
+        "p99_note": "combined p99 is calculated from per-run generator+discriminator sums",
+    }
+
+
+def print_optimization_tables(ranking: dict[str, list[dict]]) -> None:
+    print("\nOptimization ranking: leaf stages by combined median (descending)", flush=True)
+    print(
+        f"{'#':>3} {'stage':<42} {'category':<13} "
+        f"{'gen med':>10} {'dis med':>10} {'total med':>11} "
+        f"{'total mean':>11} {'total p99':>11} {'share':>7}",
+        flush=True,
+    )
+    for row in ranking["stage_rows"][:RANKING_TABLE_LIMIT]:
+        combined = row["combined"]
+        generator = row["generator"]
+        discriminator = row["discriminator"]
+        print(
+            f"{row['rank']:3d} {row['stage']:<42.42s} {row['category']:<13} "
+            f"{generator['median_ms']:10.3f} {discriminator['median_ms']:10.3f} "
+            f"{combined['median_ms']:11.3f} {combined['mean_ms']:11.3f} "
+            f"{combined['p99_ms']:11.3f} {row['median_share_percent']:6.1f}%",
+            flush=True,
+        )
+    if len(ranking["stage_rows"]) > RANKING_TABLE_LIMIT:
+        print(
+            f"... {len(ranking['stage_rows']) - RANKING_TABLE_LIMIT} more leaf stages "
+            "are preserved in the JSON report.",
+            flush=True,
+        )
+
+    print("\nOptimization direction ranking: component categories", flush=True)
+    print(
+        f"{'#':>3} {'category':<13} {'gen med':>10} {'dis med':>10} "
+        f"{'total med':>11} {'total mean':>11} {'total p99':>11} {'share':>7}  direction",
+        flush=True,
+    )
+    for row in ranking["category_rows"]:
+        combined = row["combined"]
+        print(
+            f"{row['rank']:3d} {row['category']:<13} "
+            f"{row['generator']['median_ms']:10.3f} "
+            f"{row['discriminator']['median_ms']:10.3f} "
+            f"{combined['median_ms']:11.3f} {combined['mean_ms']:11.3f} "
+            f"{combined['p99_ms']:11.3f} {row['median_share_percent']:6.1f}%  "
+            f"{row['direction']}",
+            flush=True,
+        )
 
 
 def compare(reference: np.ndarray, candidate: np.ndarray) -> dict:
@@ -492,6 +713,7 @@ def main() -> int:
         "models": {},
         "failures": [],
     }
+    timing_samples: dict[str, dict[str, list[float]]] = {}
 
     print("PTV3 synchronized stage profile", flush=True)
     print(
@@ -526,6 +748,7 @@ def main() -> int:
                     run_partitioned(model, data, device)
 
                 samples = defaultdict(list)
+                timing_samples[encoder] = samples
                 partitioned_output = None
                 for run_index in range(PROFILE_RUNS):
                     partitioned_output = run_partitioned(
@@ -610,6 +833,17 @@ def main() -> int:
             }
         )
         print(f"[FAIL] setup: {exc!r}", flush=True)
+
+    ranking = build_optimization_ranking(timing_samples) if len(timing_samples) == len(ENCODERS) else {
+        "stage_rows": [],
+        "category_rows": [],
+        "sort_key": "combined.median_ms descending",
+        "stage_table_limit": RANKING_TABLE_LIMIT,
+        "p99_note": "ranking unavailable because one or more encoders failed",
+    }
+    report["optimization_ranking"] = ranking
+    if ranking["stage_rows"]:
+        print_optimization_tables(ranking)
 
     passed = bool(
         len(report["models"]) == len(ENCODERS)
