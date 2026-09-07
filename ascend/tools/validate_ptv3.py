@@ -327,6 +327,38 @@ def print_case(result: dict) -> None:
     )
 
 
+def print_encoder_totals(results: list[dict]) -> list[dict]:
+    by_case = {(r["encoder"], r["point_count"]): r["latency"] for r in results}
+    totals = []
+    print("\nGenerator + discriminator latency (ms; sums of separate measurements)", flush=True)
+    print(
+        f"{'points':>6} {'gen mean':>10} {'dis mean':>10} {'sum mean':>10} "
+        f"{'gen median':>11} {'dis median':>11} {'sum median':>11}",
+        flush=True,
+    )
+    for point_count in POINT_COUNTS:
+        generator = by_case.get(("generator", point_count))
+        discriminator = by_case.get(("discriminator", point_count))
+        if generator is None or discriminator is None:
+            print(f"{point_count:6d} N/A (missing encoder result)", flush=True)
+            continue
+        mean_sum = generator["mean_ms"] + discriminator["mean_ms"]
+        median_sum = generator["median_ms"] + discriminator["median_ms"]
+        totals.append({
+            "point_count": point_count,
+            "mean_ms_sum": mean_sum,
+            "median_ms_sum": median_sum,
+        })
+        print(
+            f"{point_count:6d} {generator['mean_ms']:10.3f} "
+            f"{discriminator['mean_ms']:10.3f} {mean_sum:10.3f} "
+            f"{generator['median_ms']:11.3f} "
+            f"{discriminator['median_ms']:11.3f} {median_sum:11.3f}",
+            flush=True,
+        )
+    return totals
+
+
 def main() -> int:
     report = {
         "contract": {
@@ -399,7 +431,6 @@ def main() -> int:
             report["contract"]["parameter_layout"] = sorted({
                 f"{p.device}/{p.dtype}" for p in model.parameters()
             })
-            print(f"{encoder}: {report['contract']['parameter_layout']}", flush=True)
             runtime_failed = False
             for point_count in POINT_COUNTS:
                 try:
@@ -457,9 +488,10 @@ def main() -> int:
         "correctness": "PASS" if correctness_passed else "FAIL",
         "performance_target": "PASS" if performance_passed else "FAIL",
     }
-    write_report(report)
     print(f"ACCURACY: {report['summary']['correctness']}", flush=True)
     print(f"PERFORMANCE TARGET (report only): {report['summary']['performance_target']}", flush=True)
+    report["latency_totals"] = print_encoder_totals(report["results"])
+    write_report(report)
     print(f"Report: {RESULT_PATH}", flush=True)
     return 0 if correctness_passed else 1
 
