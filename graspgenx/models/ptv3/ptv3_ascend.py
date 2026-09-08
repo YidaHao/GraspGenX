@@ -40,6 +40,26 @@ class AscendSerializedAttention(VanillaSerializedAttention):
         self.load_state_dict(source.state_dict(), strict=True)
         self.to(device=NPU_DEVICE, dtype=torch.float16)
 
+    def prepare_indices(self, point):
+        count = point.feat.shape[0]
+        single_batch = point.offset.numel() == 1
+        self.patch_size = min(
+            count if single_batch else offset2bincount(point.offset).min().item(),
+            self.patch_size_max,
+        )
+        # For a single cloud with complete patches, pad/unpad are identities.
+        # Use the current point's views, not a cache shared across point clouds.
+        if single_batch and self.patch_size > 0 and count % self.patch_size == 0:
+            return (
+                point.serialized_order[self.order_index],
+                point.serialized_inverse[self.order_index],
+            )
+        pad, unpad, _ = self.get_padding_and_inverse(point)
+        return (
+            point.serialized_order[self.order_index][pad],
+            unpad[point.serialized_inverse[self.order_index]],
+        )
+
     def forward(self, point):
         if self.training:
             raise RuntimeError("Ascend PTV3 is inference-only; call eval() first")
@@ -49,13 +69,8 @@ class AscendSerializedAttention(VanillaSerializedAttention):
             if parameter.device.type != "npu" or parameter.dtype != torch.float16:
                 raise RuntimeError("Attention parameters must remain NPU FP16")
 
-        self.patch_size = min(
-            offset2bincount(point.offset).min().item(), self.patch_size_max
-        )
+        order, inverse = self.prepare_indices(point)
         h, k, c = self.num_heads, self.patch_size, self.channels
-        pad, unpad, _ = self.get_padding_and_inverse(point)
-        order = point.serialized_order[self.order_index][pad]
-        inverse = unpad[point.serialized_inverse[self.order_index]]
 
         device = self.qkv.weight.device
         features = point.feat.to(device=device, dtype=torch.float16)
