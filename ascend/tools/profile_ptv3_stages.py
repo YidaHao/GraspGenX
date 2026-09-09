@@ -24,9 +24,11 @@ kappa. ``USE_CUDA_GOLDEN=False`` selects synthetic inputs and random weights;
 device placement still follows the selected implementation import.
 
 Select the implementation by commenting/uncommenting the imports below.
-Ascend defaults to NPU FP16 attention; vanilla uses CPU FP32. Result names
-follow the import. Attention timing includes outer LayerNorm/residual and
-CPU/NPU transfers; profile timings include per-stage synchronization overhead.
+Ascend keeps attention/residual/norm/FFN on NPU FP16; vanilla uses CPU FP32.
+Result names follow the import. For the resident block, attention timing covers
+H2D, norm1 and attention; FFN timing covers add/norm2, FFN, residual and D2H.
+Compare their combined time across implementations, since these boundaries
+differ from vanilla. Profile timings include per-stage synchronization overhead.
 """
 
 from __future__ import annotations
@@ -60,6 +62,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BASELINE_DIR = REPO_ROOT / "ascend/baselines/ptv3-cuda-fp32-eager"
 POINT_COUNT = 2048
 RESULT_DIR = REPO_ROOT / "ascend/results"
+EXPERIMENT_TAG = "ffn_resident"
 
 USE_CUDA_GOLDEN = True
 ENCODERS = ("generator", "discriminator")
@@ -144,7 +147,7 @@ from graspgenx.models.ptv3.ptv3_ascend import (
 
 IMPLEMENTATION = PointTransformerV3.__module__
 RESULT_PATH = RESULT_DIR / (
-    f"{IMPLEMENTATION.rsplit('.', 1)[-1]}_profile_n{POINT_COUNT}.json"
+    f"{IMPLEMENTATION.rsplit('.', 1)[-1]}_{EXPERIMENT_TAG}_profile_n{POINT_COUNT}.json"
 )
 
 
@@ -589,6 +592,8 @@ def run_block_cpe(block, point: VanillaPoint) -> VanillaPoint:
 
 
 def run_block_attention(block, point: VanillaPoint) -> VanillaPoint:
+    if hasattr(block, "forward_attention"):
+        return block.forward_attention(point)
     shortcut = point.feat
     if block.pre_norm:
         point.feat = block.norm1(point.feat)
@@ -598,6 +603,8 @@ def run_block_attention(block, point: VanillaPoint) -> VanillaPoint:
 
 
 def run_block_ffn(block, point: VanillaPoint) -> VanillaPoint:
+    if hasattr(block, "forward_ffn"):
+        return block.forward_ffn(point)
     shortcut = point.feat
     if block.pre_norm:
         point.feat = block.norm2(point.feat)
@@ -663,6 +670,7 @@ def main() -> int:
             report["contract"]["parameter_layout"] = sorted({
                 f"{p.device}/{p.dtype}" for p in model.parameters()
             })
+            report["contract"]["execution"] = getattr(model, "execution_config", {})
             print(f"{encoder}: {report['contract']['parameter_layout']}", flush=True)
             model_report = {}
             runtime_failed = False

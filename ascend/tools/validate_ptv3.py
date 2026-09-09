@@ -24,8 +24,8 @@ Each reference contains already sampled, mean-centered, kappa-scaled points.
 Do not preprocess ``points`` again before passing them to PTV3.
 
 Select the implementation by commenting/uncommenting the imports below.
-Ascend defaults to NPU FP16 attention; vanilla uses CPU FP32. No device or
-precision switch is needed. Timings include every feature/index copy.
+Ascend keeps attention/residual/norm/FFN on NPU FP16; vanilla uses CPU FP32.
+No device or precision switch is needed. Timings include every feature/index copy.
 Result names follow the imported implementation, preserving the CUDA golden.
 """
 
@@ -58,6 +58,7 @@ except ImportError:  # CPU baseline remains usable without torch-npu
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BASELINE_DIR = REPO_ROOT / "ascend/baselines/ptv3-cuda-fp32-eager"
 RESULT_DIR = REPO_ROOT / "ascend/results"
+EXPERIMENT_TAG = "ffn_resident"
 POINT_COUNTS = (64, 2048, 3500)
 ENCODERS = ("generator", "discriminator")
 WARMUP_RUNS = 3
@@ -140,7 +141,7 @@ from graspgenx.models.ptv3.ptv3_ascend import PointTransformerV3Ascend as PointT
 # from graspgenx.models.ptv3.ptv3_vanilla import PointTransformerV3Vanilla as PointTransformerV3
 
 IMPLEMENTATION = PointTransformerV3.__module__
-RESULT_PATH = RESULT_DIR / f"{IMPLEMENTATION.rsplit('.', 1)[-1]}_validation.json"
+RESULT_PATH = RESULT_DIR / f"{IMPLEMENTATION.rsplit('.', 1)[-1]}_{EXPERIMENT_TAG}_validation.json"
 
 
 def sha256_file(path: Path) -> str:
@@ -431,6 +432,7 @@ def main() -> int:
             report["contract"]["parameter_layout"] = sorted({
                 f"{p.device}/{p.dtype}" for p in model.parameters()
             })
+            report["contract"]["execution"] = getattr(model, "execution_config", {})
             runtime_failed = False
             for point_count in POINT_COUNTS:
                 try:
