@@ -12,6 +12,7 @@ import torch
 import torch_npu  # noqa: F401
 
 from .ptv3_vanilla import (
+    HashSparseConv3d,
     PointTransformerV3Vanilla,
     VanillaPoint,  # re-export for the stage profiler
     VanillaPointModule,
@@ -174,6 +175,7 @@ class AscendBlock(VanillaPointModule):
         self.pre_norm = source.pre_norm
         for name, module in source.named_children():
             self.add_module(name, module)
+        self.cpe_conv = CachedCPEConv(source.cpe_conv)
         self.norm1.to(device=NPU_DEVICE, dtype=torch.float16)
         self.norm2.to(device=NPU_DEVICE, dtype=torch.float16)
         self.mlp = AscendFFN(source.mlp)
@@ -215,9 +217,13 @@ class AscendBlock(VanillaPointModule):
         point.feat = (residual + output).to(device="cpu", dtype=torch.float32)
         return point
 
-    def forward(self, point):
-        cpe = self.cpe_conv(point.feat, point.grid_coord, point.batch)
+    def forward_cpe(self, point):
+        cpe = self.cpe_conv(point.feat, point.grid_coord, point.batch, point)
         point.feat = point.feat + self.cpe_norm(self.cpe_linear(cpe))
+        return point
+
+    def forward(self, point):
+        point = self.forward_cpe(point)
         point = self.forward_attention(point)
         return self.forward_ffn(point)
 
@@ -233,8 +239,54 @@ class PointTransformerV3Ascend(PointTransformerV3AttentionOnly):
             fuse_add_layer_norm=FUSE_ADD_LAYER_NORM,
             fuse_ffn=FUSE_FFN,
             ffn_inner_precise=1 if FUSE_FFN else None,
+            cpe_map_cache="per_point_per_forward",
+            cpe_compute="cpu_fp32",
+            cpe_post_ops="cpu_fp32",
         )
         for stage in self.enc:
             for name, block in list(stage.named_children()):
                 if hasattr(block, "attn"):
                     setattr(stage, name, AscendBlock(block))
+
+
+class CachedCPEConv(HashSparseConv3d):
+    """CPU CPE with a point-local map shared by blocks with identical geometry."""
+
+    def __init__(self, source):
+        # Reuse parameters/buffers: wrapping must not change keys or consume RNG.
+        torch.nn.Module.__init__(self)
+        self.in_channels = source.in_channels
+        self.out_channels = source.out_channels
+        self.kernel_size = source.kernel_size
+        self.weight = source.weight
+        self.bias = source.bias
+        self.register_buffer("offsets", source.offsets)
+
+    def _get_neighbor_map(self, grid_coord, batch, point):
+        n, volume = grid_coord.shape[0], self.offsets.shape[0]
+        cache_key = f"_cpe_hash_map_{self.kernel_size}"
+        if cache_key not in point:
+            # Preserve vanilla's sort/searchsorted tie-breaking, including duplicate
+            # voxels and hash collisions. Geometry stays fixed within this stage.
+            sorted_keys, sort_idx = self._hash(batch, grid_coord).sort()
+            neighbor_coords = grid_coord.unsqueeze(1) + self.offsets.unsqueeze(0)
+            neighbor_batch = batch.unsqueeze(1).expand(-1, volume)
+            keys = self._hash(neighbor_batch.reshape(-1), neighbor_coords.reshape(-1, 3))
+            positions = torch.searchsorted(sorted_keys, keys).clamp(max=n - 1)
+            point[cache_key] = {
+                "indices": sort_idx[positions],
+                "found": sorted_keys[positions] == keys,
+            }
+        return point[cache_key]
+
+    def forward(self, feat, grid_coord, batch, point):
+        if self.training or feat.device.type != "cpu" or feat.dtype != torch.float32:
+            raise RuntimeError("Cached CPE requires eval mode and CPU FP32 features")
+        cache = self._get_neighbor_map(grid_coord, batch, point)
+        neighbors = feat[cache["indices"]] * cache["found"].unsqueeze(-1)
+        output = torch.einsum(
+            "nki,kio->no",
+            neighbors.view(feat.shape[0], self.offsets.shape[0], self.in_channels),
+            self.weight,
+        )
+        return output if self.bias is None else output + self.bias

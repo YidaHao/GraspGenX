@@ -583,6 +583,8 @@ def serialize_point(model: torch.nn.Module, data: dict) -> VanillaPoint:
 
 
 def run_block_cpe(block, point: VanillaPoint) -> VanillaPoint:
+    if hasattr(block, "forward_cpe"):
+        return block.forward_cpe(point)
     shortcut = point.feat
     cpe_out = block.cpe_conv(point.feat, point.grid_coord, point.batch)
     cpe_out = block.cpe_linear(cpe_out)
