@@ -5,7 +5,7 @@ match ptv3_vanilla. Construct, load_state_dict(strict=True), eval(), then forwar
 do not move/cast the whole model, which intentionally has mixed placement.
 No Flash, RPE, training or FP32 feature/upcast path is provided. LayerNorm's
 unused mean/rstd statistics can be FP32. PointTransformerV3AttentionOnly is the
-previous CPU-FFN control; the fusion switch below affects only new resident models.
+previous CPU-FFN control; fusion switches below affect only new resident models.
 """
 
 import torch
@@ -23,6 +23,7 @@ from .ptv3_vanilla import (
 NPU_DEVICE = "npu:0"
 NPU_JIT_COMPILE = False
 FUSE_ADD_LAYER_NORM = True
+FUSE_FFN = True
 
 
 class AscendSerializedAttention(VanillaSerializedAttention):
@@ -125,13 +126,27 @@ class PointTransformerV3AttentionOnly(PointTransformerV3Vanilla):
 
 
 class AscendFFN(torch.nn.Module):
-    """FP16 FFN retaining the original checkpoint keys."""
+    """FP16 FFN with the original checkpoint keys and optional CANN FFN fusion."""
 
     def __init__(self, source):
         super().__init__()
         self.fc1 = source.fc1.to(device=NPU_DEVICE, dtype=torch.float16)
         self.fc2 = source.fc2.to(device=NPU_DEVICE, dtype=torch.float16)
         self.act = source.act
+        self.use_fused = FUSE_FFN
+        self.register_buffer("weight1", None, persistent=False)
+        self.register_buffer("weight2", None, persistent=False)
+        self.register_load_state_dict_post_hook(self._pack_weights)
+        self._pack_weights(self, None)
+
+    @staticmethod
+    @torch.no_grad()
+    def _pack_weights(module, _incompatible):
+        # FFN expects [C, 4C] and [4C, C], unlike nn.Linear's transposed layout.
+        # Repack after checkpoint reloads; never transpose weights per request.
+        if module.use_fused:
+            module.weight1 = module.fc1.weight.T.contiguous()
+            module.weight2 = module.fc2.weight.T.contiguous()
 
     def forward(self, features):
         if (
@@ -140,6 +155,11 @@ class AscendFFN(torch.nn.Module):
             or features.device.type != "npu"
         ):
             raise RuntimeError("FFN requires eval mode and NPU FP16 features")
+        if self.use_fused:
+            return torch_npu.npu_ffn(
+                features, self.weight1, self.weight2, "gelu",
+                bias1=self.fc1.bias, bias2=self.fc2.bias, inner_precise=1,
+            )
         return self.fc2(self.act(self.fc1(features)))
 
 
@@ -211,6 +231,8 @@ class PointTransformerV3Ascend(PointTransformerV3AttentionOnly):
             dense_resident=True,
             norm_residual_ffn_dtype="fp16",
             fuse_add_layer_norm=FUSE_ADD_LAYER_NORM,
+            fuse_ffn=FUSE_FFN,
+            ffn_inner_precise=1 if FUSE_FFN else None,
         )
         for stage in self.enc:
             for name, block in list(stage.named_children()):
