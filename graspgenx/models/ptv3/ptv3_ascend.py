@@ -3,8 +3,9 @@
 Load CANN's set_env.sh before use. Checkpoint keys and the point/output contract
 match ptv3_vanilla. Construct, load_state_dict(strict=True), eval(), then forward;
 do not move/cast the whole model, which intentionally has mixed placement.
-No Flash, RPE, training or FP32 feature/upcast path is provided.
-PointTransformerV3AttentionOnly is the previous CPU-FFN control.
+No Flash, RPE, training or FP32 feature/upcast path is provided. LayerNorm's
+unused mean/rstd statistics can be FP32. PointTransformerV3AttentionOnly is the
+previous CPU-FFN control; the fusion switch below affects only new resident models.
 """
 
 import torch
@@ -21,6 +22,7 @@ from .ptv3_vanilla import (
 
 NPU_DEVICE = "npu:0"
 NPU_JIT_COMPILE = False
+FUSE_ADD_LAYER_NORM = True
 
 
 class AscendSerializedAttention(VanillaSerializedAttention):
@@ -155,6 +157,7 @@ class AscendBlock(VanillaPointModule):
         self.norm1.to(device=NPU_DEVICE, dtype=torch.float16)
         self.norm2.to(device=NPU_DEVICE, dtype=torch.float16)
         self.mlp = AscendFFN(source.mlp)
+        self.fuse_add_norm = FUSE_ADD_LAYER_NORM
 
     def forward_attention(self, point):
         if self.training:
@@ -173,11 +176,19 @@ class AscendBlock(VanillaPointModule):
 
     def forward_ffn(self, point):
         residual = point.pop("_attention_residual")
-        residual = residual + point.feat
-        normalized = torch_npu.npu_layer_norm_eval(
-            residual, self.norm2.normalized_shape,
-            self.norm2.weight, self.norm2.bias, self.norm2.eps,
-        )
+        if self.fuse_add_norm:
+            # y and residual_sum are FP16. FP32 mean/rstd are unused statistics,
+            # not an upcast feature path between attention and FFN.
+            normalized, _, _, residual = torch_npu.npu_add_layer_norm(
+                residual, point.feat, self.norm2.weight, self.norm2.bias,
+                epsilon=self.norm2.eps, additional_output=True,
+            )
+        else:
+            residual = residual + point.feat
+            normalized = torch_npu.npu_layer_norm_eval(
+                residual, self.norm2.normalized_shape,
+                self.norm2.weight, self.norm2.bias, self.norm2.eps,
+            )
         output = self.mlp(normalized)
         if output.dtype != torch.float16 or residual.dtype != torch.float16:
             raise RuntimeError("FFN output and residual must remain FP16")
@@ -199,6 +210,7 @@ class PointTransformerV3Ascend(PointTransformerV3AttentionOnly):
         self.execution_config.update(
             dense_resident=True,
             norm_residual_ffn_dtype="fp16",
+            fuse_add_layer_norm=FUSE_ADD_LAYER_NORM,
         )
         for stage in self.enc:
             for name, block in list(stage.named_children()):
