@@ -137,7 +137,8 @@ os.environ.setdefault("GRASPGENX_CHECKPOINT_DIR", str(BASELINE_DIR))
 install_minimal_import_shims()
 
 # Select exactly one import. Nothing else needs changing for a CPU control.
-from graspgenx.models.ptv3.ptv3_ascend import PointTransformerV3Ascend as PointTransformerV3
+# from graspgenx.models.ptv3.ptv3_ascend import PointTransformerV3Ascend as PointTransformerV3
+from graspgenx.models.ptv3.ptv3_ascend import PointTransformerV3Subm as PointTransformerV3
 # from graspgenx.models.ptv3.ptv3_vanilla import PointTransformerV3Vanilla as PointTransformerV3
 
 IMPLEMENTATION = PointTransformerV3.__module__

@@ -290,3 +290,54 @@ class CachedCPEConv(HashSparseConv3d):
             self.weight,
         )
         return output if self.bias is None else output + self.bias
+
+
+class SubMCPEConv(CachedCPEConv):
+    """Optional NPU compute; platform support is declared by the custom OPP."""
+
+    def __init__(self, source):
+        super().__init__(source)
+        self._supported_shape = self.kernel_size in (1, 3, 5) and all(
+            16 <= c <= 512 and c % 16 == 0
+            for c in (self.in_channels, self.out_channels)
+        )
+        self.register_buffer("npu_weight", None, persistent=False)
+        if self._supported_shape:
+            from ascend.custom_ops.submconv3d import submconv3d  # noqa: F401
+        self.register_load_state_dict_post_hook(self._pack_weights)
+        self._pack_weights(self, None)
+
+    @staticmethod
+    @torch.no_grad()
+    def _pack_weights(module, _incompatible):
+        if module._supported_shape:
+            module.npu_weight = module.weight.to(NPU_DEVICE, torch.float16).contiguous()
+
+    def forward(self, feat, grid_coord, batch, point):
+        if not self._supported_shape or not 1 <= feat.shape[0] <= 4096:
+            return super().forward(feat, grid_coord, batch, point)
+        if self.training or feat.device.type != "cpu" or feat.dtype != torch.float32:
+            raise RuntimeError("SubM CPE requires eval mode and CPU FP32 features")
+        cache = self._get_neighbor_map(grid_coord, batch, point)
+        n, volume = feat.shape[0], self.offsets.shape[0]
+        if "npu" not in cache:
+            packed = torch.full((n, (volume + 7) // 8 * 8), -1, dtype=torch.int32)
+            packed[:, :volume] = cache["indices"].view(n, volume)
+            packed[:, :volume].masked_fill_(~cache["found"].view(n, volume), -1)
+            cache["npu"] = packed.to(NPU_DEVICE)
+        output = torch.ops.graspgenx_subm.subm_conv3d(
+            feat.to(NPU_DEVICE, torch.float16), cache["npu"], self.npu_weight,
+        ).to(device="cpu", dtype=torch.float32)
+        return output if self.bias is None else output + self.bias
+
+
+class PointTransformerV3Subm(PointTransformerV3Ascend):
+    """CPU geometry/map/post-ops, optional SubM compute, resident FP16 dense tail."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.execution_config["cpe_compute"] = "npu_fp16_supported_shapes"
+        for stage in self.enc:
+            for block in stage.children():
+                if hasattr(block, "attn"):
+                    block.cpe_conv = SubMCPEConv(block.cpe_conv)

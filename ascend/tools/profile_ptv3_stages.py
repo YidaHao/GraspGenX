@@ -135,7 +135,8 @@ install_minimal_import_shims()
 
 # Select exactly one import block. Nothing else needs changing for a CPU control.
 from graspgenx.models.ptv3.ptv3_ascend import (
-    PointTransformerV3Ascend as PointTransformerV3,
+    # PointTransformerV3Ascend as PointTransformerV3,
+    PointTransformerV3Subm as PointTransformerV3,
     VanillaPoint,
     segment_csr_vanilla,
 )
