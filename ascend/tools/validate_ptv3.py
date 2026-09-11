@@ -58,7 +58,7 @@ except ImportError:  # CPU baseline remains usable without torch-npu
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BASELINE_DIR = REPO_ROOT / "ascend/baselines/ptv3-cuda-fp32-eager"
 RESULT_DIR = REPO_ROOT / "ascend/results"
-EXPERIMENT_TAG = "cpe_g4_mixed"
+EXPERIMENT_TAG = "grid_encode_four_orders"
 POINT_COUNTS = (64, 2048, 3500)
 ENCODERS = ("generator", "discriminator")
 WARMUP_RUNS = 3

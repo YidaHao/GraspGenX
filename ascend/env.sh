@@ -9,4 +9,5 @@ fi
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh || return
 source ascend/custom_ops/submconv3d/env.sh
+source ascend/custom_ops/grid_encode/env.sh || return
 export PYTHONPATH="$(dirname -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")")${PYTHONPATH:+:$PYTHONPATH}"

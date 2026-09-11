@@ -146,7 +146,7 @@ Torch-NPU 单算子 `jit_compile` 与 TorchAir 图编译是不同开关。库本
 SUBM_SMOKE=1 bash ascend/tests/run_tests.sh -v
 ```
 
-Ascend 的三份测试统一位于 `ascend/tests/`；入口自动加载算子环境，依次在独立 Python 进程中运行卷积、建图和 CPE 集成测试，并启用 CPE 的 NPU 用例。根目录 `tests/` 的通用/CUDA 测试不变。单独执行或指定 unittest 用例时，先加载环境：
+Ascend 测试统一位于 `ascend/tests/`；入口自动加载 CPE 和 GridEncode 两个已构建的私有算子环境，依次在独立 Python 进程中运行三份 CPE 测试及两份 GridEncode 测试，并启用 NPU 用例。根目录 `tests/` 的通用/CUDA 测试不变。仅测试 CPE 或指定 unittest 用例时，仍可单独加载 CPE 环境：
 
 ```bash
 source ascend/custom_ops/submconv3d/env.sh
@@ -161,7 +161,7 @@ PTV3_CPE_NPU=1 "$PYTHON_BIN" -B ascend/tests/test_ptv3_cpe.py -v
 
 P1 真实模型 3 进程 x 20 样本比较及合并后的默认模型 validator 均已完成，G/D x 三种点数共六组全部通过 golden 精度门槛，最低 cosine 为 0.9999591909124736，repeat drift 为 0；合并后六组输出与本轮旧 SubM 控制逐位一致。默认 stage profiler 的 2048 点 G/D 检查也通过。P3 最低 cosine 为 0.9999688915。这些是 encoder 精度验证，不是完整抓取质量验证。
 
-PTV3 的 SubM 接入统一为 `graspgenx/models/ptv3/ptv3_ascend.py` 中的 `PointTransformerV3Ascend`；`PointTransformerV3Subm` 已移除且无别名。默认是 **CPU 精确保留原 `.sort()` 代表行 + NPU `BuildSubmMap` 查询 + NPU FP16 `SubmConv3d`**。CPE 的 bias/Linear/LayerNorm/残差仍为 CPU FP32；连续 NPU FP16 attention/residual/LayerNorm/FFN 区域不变，几何、serialization、downsampling、Cin=3 stem 仍在 CPU，**不是全 NPU encoder**。
+PTV3 的 SubM 接入统一为 `graspgenx/models/ptv3/ptv3_ascend.py` 中的 `PointTransformerV3Ascend`；`PointTransformerV3Subm` 已移除且无别名。CPE 默认是 **CPU 精确保留原 `.sort()` 代表行 + NPU `BuildSubmMap` 查询 + NPU FP16 `SubmConv3d`**。CPE 后处理及连续 NPU FP16 dense 区域不变。当前初始四路空间编码另由 [GridEncode](../grid_encode/README.md) 执行；网格化、depth、batch 拼接、排序/inverse、downsampling 和 Cin=3 stem 仍在 CPU，**不是全 NPU encoder**。
 
 真实点云可有重复体素或 hash 碰撞，默认使用代表行分支而非独立唯一坐标分支。坐标/batch 超出 int32 时，模型先用 CPU reference map，再执行 NPU 卷积；不支持的卷积形状/N 则使用 CPU map+卷积。这是适配器显式回退，不是 CANN 自动提供 CPU kernel；NPU 运行异常不会静默重试 CPU。
 
@@ -179,12 +179,15 @@ map 只在当前点云、当前 stage、单次前向内复用。缓存是内部�
 
 ```bash
 source ascend/custom_ops/submconv3d/env.sh
+source ascend/custom_ops/grid_encode/env.sh
 "$PYTHON_BIN" ascend/tools/benchmark_ptv3_subm.py
 ```
 
 需要原有 `ascend/baselines/ptv3-cuda-fp32-eager/` 中两套权重和三份 reference NPZ。配置在脚本顶部，结果写入新的 `ascend/results/subm_compare_*` 目录，不覆盖 golden。三方案逐样本轮换顺序；`current` 也不是历史未缓存控制。测量是单对象、混合 eager、encoder-only，含每次前向的建图和传输，不是完整抓取流程。用户已明确选择 P1 优先采用现行默认，接受 P3 大点数回退，不主张普遍加速。
 
 ## 6. 手段与结果
+
+以下为加入 GridEncode 前的历史 CPE 数据，保留原记录。当前重跑会对所有 CPE 控制统一使用新默认空间编码，不能将不同批次的绝对延迟差直接归因于 CPE。
 
 ### 默认路径三方案比较
 

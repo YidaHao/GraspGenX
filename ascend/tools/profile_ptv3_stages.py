@@ -62,7 +62,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BASELINE_DIR = REPO_ROOT / "ascend/baselines/ptv3-cuda-fp32-eager"
 POINT_COUNT = 2048
 RESULT_DIR = REPO_ROOT / "ascend/results"
-EXPERIMENT_TAG = "cpe_g4_mixed"
+EXPERIMENT_TAG = "grid_encode_four_orders"
 
 USE_CUDA_GOLDEN = True
 ENCODERS = ("generator", "discriminator")
@@ -577,6 +577,8 @@ def run_partitioned(
 
 
 def serialize_point(model: torch.nn.Module, data: dict) -> VanillaPoint:
+    if hasattr(model, "serialize_point"):
+        return model.serialize_point(data)
     point = VanillaPoint(data)
     point.serialization(order=model.order, shuffle_orders=model.shuffle_orders)
     return point

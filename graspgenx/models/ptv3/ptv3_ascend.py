@@ -243,11 +243,55 @@ class PointTransformerV3Ascend(PointTransformerV3AttentionOnly):
             cpe_compute="npu_fp16_supported_shapes",
             cpe_map="cpu_representatives_npu_query",
             cpe_post_ops="cpu_fp32",
+            serialization_compute="cpu_grid_depth_batch_sort_npu_spatial_codes",
         )
         for stage in self.enc:
             for name, block in list(stage.named_children()):
                 if hasattr(block, "attn"):
                     setattr(stage, name, AscendBlock(block))
+
+    @torch.inference_mode()
+    def serialize_point(self, data_dict):
+        point = VanillaPoint(data_dict)
+        if "grid_coord" not in point:
+            assert {"grid_size", "coord"}.issubset(point.keys())
+            point.grid_coord = torch.div(
+                point.coord - point.coord.min(0)[0], point.grid_size,
+                rounding_mode="trunc").int()
+        grid = point.grid_coord
+        depth = int(grid.max()).bit_length()
+        orders = ("z", "z-trans", "hilbert", "hilbert-trans")
+        if not (tuple(self.order) == orders and grid.device.type == "cpu"
+                and grid.dtype in (torch.int32, torch.int64)
+                and grid.shape == (len(point.batch), 3)
+                and 1 <= len(grid) <= 4096 and 1 <= depth <= 16
+                and grid.min() >= 0):
+            # Preserve reference handling of non-default orders and out-of-domain
+            # inputs, including its depth-zero failure. Never catch NPU errors.
+            point.serialization(order=self.order, depth=depth, shuffle_orders=self.shuffle_orders)
+            return point
+        assert depth * 3 + len(point.offset).bit_length() <= 63
+        from ascend.custom_ops.grid_encode.grid_encode import grid_encode
+
+        spatial = grid_encode(grid.to(NPU_DEVICE, torch.int32).contiguous(), depth)
+        code = spatial.cpu().T.contiguous() | (point.batch.long() << (depth * 3))
+        order = torch.argsort(code)
+        inverse = torch.zeros_like(order).scatter_(
+            1, order, torch.arange(code.shape[1]).repeat(code.shape[0], 1))
+        if self.shuffle_orders:
+            permutation = torch.randperm(code.shape[0])
+            code, order, inverse = code[permutation], order[permutation], inverse[permutation]
+        point.update(serialized_depth=depth, serialized_code=code,
+                     serialized_order=order, serialized_inverse=inverse)
+        return point
+
+    def forward(self, data_dict):
+        point = self.serialize_point(data_dict)
+        point = self.embedding(point)
+        point = self.enc(point)
+        pooled = segment_csr_vanilla(
+            point.feat, torch.nn.functional.pad(point.offset, (1, 0)), reduce="mean")
+        return self.projection(pooled)
 
 
 class CachedCPEConv(HashSparseConv3d):
