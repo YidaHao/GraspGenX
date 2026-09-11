@@ -62,7 +62,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BASELINE_DIR = REPO_ROOT / "ascend/baselines/ptv3-cuda-fp32-eager"
 POINT_COUNT = 2048
 RESULT_DIR = REPO_ROOT / "ascend/results"
-EXPERIMENT_TAG = "ffn_resident"
+EXPERIMENT_TAG = "cpe_g4_mixed"
 
 USE_CUDA_GOLDEN = True
 ENCODERS = ("generator", "discriminator")
@@ -135,8 +135,7 @@ install_minimal_import_shims()
 
 # Select exactly one import block. Nothing else needs changing for a CPU control.
 from graspgenx.models.ptv3.ptv3_ascend import (
-    # PointTransformerV3Ascend as PointTransformerV3,
-    PointTransformerV3Subm as PointTransformerV3,
+    PointTransformerV3Ascend as PointTransformerV3,
     VanillaPoint,
     segment_csr_vanilla,
 )

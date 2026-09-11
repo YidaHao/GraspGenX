@@ -4,6 +4,8 @@ export ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/8.
 source "$ASCEND_HOME_PATH/$(uname -m)-linux/bin/setenv.bash"
 export ASCEND_TOOLKIT_HOME="$ASCEND_HOME_PATH"
 export TOOLCHAIN_HOME="$ASCEND_HOME_PATH/toolkit"
+# CANN 8.1 warns on an unset switch, although it already behaves like 0.
+export TILINGKEY_PAR_COMPILE="${TILINGKEY_PAR_COMPILE:-0}"
 export PYTHONPATH="$ASCEND_HOME_PATH/toolkit/python/site-packages:$ASCEND_HOME_PATH/compiler/python/site-packages:${PYTHONPATH:-}"
 # Keep openEuler's installed /usr/local Python packages visible to CANN.
 export PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"

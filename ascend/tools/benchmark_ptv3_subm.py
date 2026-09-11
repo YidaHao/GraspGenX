@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import traceback
+from types import MethodType
 
 import numpy as np
 import torch
@@ -34,24 +35,45 @@ from ascend.tools import validate_ptv3 as validation
 from ascend.tools import profile_ptv3_stages as profiler
 from graspgenx.models.ptv3.ptv3_ascend import (
     PointTransformerV3Ascend,
-    PointTransformerV3Subm,
+    CachedCPEConv,
+    NPU_DEVICE,
 )
 from graspgenx.models.ptv3.ptv3_vanilla import HashSparseConv3d
 
-VARIANTS = {
-    "current": PointTransformerV3Ascend,
-    "npu_subm": PointTransformerV3Subm,
-}
+# Historical labels identify benchmark-only ablations, not model API choices.
+VARIANTS = ("current", "npu_subm", "mixed_subm")
 
 
 def write_json(path, data):
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
-def model_from_weights(cls, state):
-    model = cls(in_channels=3, output_dim=512, grid_size=0.01,
-                enable_flash=False, shuffle_orders=False)
+def cpu_map_control(conv, grid, batch, point):
+    cache = conv._get_neighbor_map(grid, batch, point)
+    if "npu" not in cache:
+        n, volume = grid.shape[0], conv.kernel_size**3
+        packed = torch.full((n, (volume + 7) // 8 * 8), -1, dtype=torch.int32)
+        packed[:, :volume] = cache["indices"].view(n, volume)
+        packed[:, :volume].masked_fill_(~cache["found"].view(n, volume), -1)
+        cache["npu"] = packed.to(NPU_DEVICE)
+    return cache["npu"]
+
+
+def model_from_weights(state, variant):
+    model = PointTransformerV3Ascend(in_channels=3, output_dim=512, grid_size=0.01,
+                                   enable_flash=False, shuffle_orders=False)
     model.load_state_dict(state, strict=True)
+    if variant != "mixed_subm":
+        for stage in model.enc:
+            for block in stage.children():
+                if hasattr(block, "attn"):
+                    if variant == "current":
+                        block.cpe_conv = CachedCPEConv(block.cpe_conv)
+                    else:
+                        block.cpe_conv._get_npu_map = MethodType(cpu_map_control, block.cpe_conv)
+        model.execution_config["cpe_map"] = "cpu_full_map"
+        if variant == "current":
+            model.execution_config["cpe_compute"] = "cpu_fp32"
     for module in model.modules():
         if hasattr(module, "shuffle_orders"):
             module.shuffle_orders = False
@@ -92,7 +114,7 @@ def run_round(index, destination):
         for encoder in ENCODERS:
             state = torch.load(BASELINE_DIR / validation.WEIGHT_FILES[encoder],
                                map_location="cpu", weights_only=False)["model"]
-            models = {name: model_from_weights(cls, state) for name, cls in VARIANTS.items()}
+            models = {name: model_from_weights(state, name) for name in VARIANTS}
             report["execution_configs"] = {name: model.execution_config for name, model in models.items()}
             del state
             for count in POINT_COUNTS:
@@ -108,7 +130,7 @@ def run_round(index, destination):
                 samples = {name: [] for name in models}
                 outputs = {}
                 names = list(models)
-                # Rotate A/B order every measurement and every fresh process.
+                # Rotate all controls/candidates each measurement and process.
                 for step in range(MEASURED_RUNS):
                     first = (index + step) % len(names)
                     for name in names[first:] + names[:first]:
@@ -131,6 +153,7 @@ def run_round(index, destination):
                         "encoder": encoder, "point_count": count, "variant": name,
                         "accuracy": validation.compare(golden, actual),
                         "vs_current": validation.compare(arrays["current"], actual),
+                        "vs_cpu_map_subm": validation.compare(arrays["npu_subm"], actual),
                         "repeat_max_abs": max(drift), "repeats_valid": repeats_valid,
                         "latency": validation.summarize_ms(samples[name]),
                         "latency_samples_ms": samples[name], "geometry": geometry,
@@ -150,6 +173,8 @@ def run_round(index, destination):
                         stage_samples = defaultdict(list)
                         for _ in range(PROFILE_RUNS):
                             profiled = profiler.run_partitioned(model, data, stage_samples)
+                            if not validation.compare(arrays[name], profiled)["passed"]:
+                                raise RuntimeError(f"invalid partitioned CPE profile: {name} {encoder}")
                         categories = defaultdict(lambda: [0.0] * PROFILE_RUNS)
                         for stage_name, values in stage_samples.items():
                             if profiler.is_leaf_stage(stage_name):
@@ -184,16 +209,20 @@ def main():
                      "process_runs": PROCESS_RUNS, "warmup": WARMUP_RUNS,
                      "measured_runs": MEASURED_RUNS, "repeat_checks": REPEAT_CHECKS,
                      "cpu_threads": CPU_THREADS, "cosine_gate": validation.COSINE_GATE,
-                     "scope": "encoder-only; CPU maps rebuilt once/stage/forward; all transfers included",
-                     "reference": "default cached CPU CPE (not the historical uncached control)",
-                     "order": "AB/BA rotating in each process", "profile_runs": PROFILE_RUNS},
+                      "scope": "encoder-only; maps rebuilt once/stage/forward; all transfers included",
+                      "reference": "benchmark-only cached CPU CPE (not the historical uncached control)",
+                      "order": "cyclic variant rotation in each process", "profile_runs": PROFILE_RUNS},
         "environment": {"host": BENCHMARK_HOST, "device": BENCHMARK_DEVICE,
                         "torch": torch.__version__, "torch_npu": torch_npu.__version__,
                         "cann": os.environ.get("ASCEND_HOME_PATH")},
         "sources": {str(p.relative_to(REPO_ROOT)): validation.sha256_file(p) for p in (
             Path(__file__), REPO_ROOT / "graspgenx/models/ptv3/ptv3_ascend.py",
             REPO_ROOT / "graspgenx/models/ptv3/ptv3_vanilla.py",
-            REPO_ROOT / "ascend/custom_ops/submconv3d/op_kernel/subm_conv3d.cpp")},
+            REPO_ROOT / "ascend/custom_ops/submconv3d/op_kernel/subm_conv3d.cpp",
+            REPO_ROOT / "ascend/custom_ops/submconv3d/op_host/subm_conv3d.cpp",
+            REPO_ROOT / "ascend/custom_ops/submconv3d/op_kernel/build_subm_map.cpp",
+            REPO_ROOT / "ascend/custom_ops/submconv3d/op_host/build_subm_map.cpp",
+            REPO_ROOT / "ascend/custom_ops/submconv3d/build/torch_bridge.so")},
         "baseline_dir": str(BASELINE_DIR), "rounds": [],
     }
     print(f"Results: {destination}", flush=True)
@@ -251,8 +280,7 @@ def main():
                                           for k, v in medians.items()},
         })
     write_json(destination / "summary.json", report)
-    print(json.dumps({k: report[k] for k in ("aggregate", "profile_aggregate", "combined")},
-                     indent=2), flush=True)
+    print(json.dumps(report["combined"], indent=2), flush=True)
     return 0 if all(r["passed"] for r in report["aggregate"]) else 1
 
 

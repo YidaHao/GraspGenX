@@ -1,4 +1,4 @@
-"""Inference-only PTV3: CPU geometry/CPE, continuous NPU FP16 transformer tail.
+"""Inference-only PTV3: hybrid CPE and a continuous NPU FP16 transformer tail.
 
 Load CANN's set_env.sh before use. Checkpoint keys and the point/output contract
 match ptv3_vanilla. Construct, load_state_dict(strict=True), eval(), then forward;
@@ -14,11 +14,11 @@ import torch_npu  # noqa: F401
 from .ptv3_vanilla import (
     HashSparseConv3d,
     PointTransformerV3Vanilla,
-    VanillaPoint,  # re-export for the stage profiler
+    VanillaPoint,  # noqa: F401 - re-export for the stage profiler
     VanillaPointModule,
     VanillaSerializedAttention,
     offset2bincount,
-    segment_csr_vanilla,  # re-export for the stage profiler
+    segment_csr_vanilla,  # noqa: F401 - re-export for the stage profiler
 )
 
 NPU_DEVICE = "npu:0"
@@ -165,7 +165,7 @@ class AscendFFN(torch.nn.Module):
 
 
 class AscendBlock(VanillaPointModule):
-    """CPU CPE followed by one H2D/D2H pair around the entire FP16 dense tail."""
+    """NPU sparse convolution, CPU CPE post-ops, then the FP16 dense tail."""
 
     def __init__(self, source):
         super().__init__()
@@ -175,7 +175,7 @@ class AscendBlock(VanillaPointModule):
         self.pre_norm = source.pre_norm
         for name, module in source.named_children():
             self.add_module(name, module)
-        self.cpe_conv = CachedCPEConv(source.cpe_conv)
+        self.cpe_conv = SubMCPEConv(source.cpe_conv)
         self.norm1.to(device=NPU_DEVICE, dtype=torch.float16)
         self.norm2.to(device=NPU_DEVICE, dtype=torch.float16)
         self.mlp = AscendFFN(source.mlp)
@@ -229,7 +229,7 @@ class AscendBlock(VanillaPointModule):
 
 
 class PointTransformerV3Ascend(PointTransformerV3AttentionOnly):
-    """Default experiment: resident FP16 attention, residual/norm and FFN."""
+    """Hybrid SubM CPE with resident FP16 attention, residual/norm and FFN."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -240,7 +240,8 @@ class PointTransformerV3Ascend(PointTransformerV3AttentionOnly):
             fuse_ffn=FUSE_FFN,
             ffn_inner_precise=1 if FUSE_FFN else None,
             cpe_map_cache="per_point_per_forward",
-            cpe_compute="cpu_fp32",
+            cpe_compute="npu_fp16_supported_shapes",
+            cpe_map="cpu_representatives_npu_query",
             cpe_post_ops="cpu_fp32",
         )
         for stage in self.enc:
@@ -293,7 +294,7 @@ class CachedCPEConv(HashSparseConv3d):
 
 
 class SubMCPEConv(CachedCPEConv):
-    """Optional NPU compute; platform support is declared by the custom OPP."""
+    """Default CPE: reference representatives on CPU, map/conv on the NPU."""
 
     def __init__(self, source):
         super().__init__(source)
@@ -313,31 +314,36 @@ class SubMCPEConv(CachedCPEConv):
         if module._supported_shape:
             module.npu_weight = module.weight.to(NPU_DEVICE, torch.float16).contiguous()
 
+    def _get_npu_map(self, grid_coord, batch, point):
+        cache_key = f"_cpe_npu_map_{self.kernel_size}"
+        if cache_key not in point:
+            coordinates = torch.cat((batch[:, None], grid_coord), dim=1)
+            if coordinates.min() < -(2**31) or coordinates.max() >= 2**31:
+                # Keep reference semantics outside the builder's int32 range.
+                cache = self._get_neighbor_map(grid_coord, batch, point)
+                n, volume = grid_coord.shape[0], self.kernel_size**3
+                packed = torch.full((n, (volume + 7) // 8 * 8), -1, dtype=torch.int32)
+                packed[:, :volume] = cache["indices"].view(n, volume)
+                packed[:, :volume].masked_fill_(~cache["found"].view(n, volume), -1)
+                point[cache_key] = packed.to(NPU_DEVICE)
+            else:
+                # Keep CPU sort's chosen row for every hash, including collisions.
+                keys, rows = self._hash(batch, grid_coord).sort()
+                first = torch.ones_like(keys, dtype=torch.bool)
+                first[1:] = keys[1:] != keys[:-1]
+                point[cache_key] = torch.ops.graspgenx_subm.build_subm_map(
+                    coordinates.to(NPU_DEVICE, torch.int32), self.kernel_size,
+                    keys[first].to(NPU_DEVICE), rows[first].to(NPU_DEVICE, torch.int32),
+                )
+        return point[cache_key]
+
     def forward(self, feat, grid_coord, batch, point):
         if not self._supported_shape or not 1 <= feat.shape[0] <= 4096:
             return super().forward(feat, grid_coord, batch, point)
         if self.training or feat.device.type != "cpu" or feat.dtype != torch.float32:
             raise RuntimeError("SubM CPE requires eval mode and CPU FP32 features")
-        cache = self._get_neighbor_map(grid_coord, batch, point)
-        n, volume = feat.shape[0], self.offsets.shape[0]
-        if "npu" not in cache:
-            packed = torch.full((n, (volume + 7) // 8 * 8), -1, dtype=torch.int32)
-            packed[:, :volume] = cache["indices"].view(n, volume)
-            packed[:, :volume].masked_fill_(~cache["found"].view(n, volume), -1)
-            cache["npu"] = packed.to(NPU_DEVICE)
+        neighbors = self._get_npu_map(grid_coord, batch, point)
         output = torch.ops.graspgenx_subm.subm_conv3d(
-            feat.to(NPU_DEVICE, torch.float16), cache["npu"], self.npu_weight,
+            feat.to(NPU_DEVICE, torch.float16), neighbors, self.npu_weight,
         ).to(device="cpu", dtype=torch.float32)
         return output if self.bias is None else output + self.bias
-
-
-class PointTransformerV3Subm(PointTransformerV3Ascend):
-    """CPU geometry/map/post-ops, optional SubM compute, resident FP16 dense tail."""
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.execution_config["cpe_compute"] = "npu_fp16_supported_shapes"
-        for stage in self.enc:
-            for block in stage.children():
-                if hasattr(block, "attn"):
-                    block.cpe_conv = SubMCPEConv(block.cpe_conv)

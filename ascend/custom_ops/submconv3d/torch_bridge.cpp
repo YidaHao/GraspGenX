@@ -24,21 +24,41 @@ void check_forward_only(const at::Tensor& features, const at::Tensor& weight) {
               "SubMConv3d is forward only; use torch.no_grad() or detach inputs");
 }
 
-at::Tensor build_subm_map(const at::Tensor& indices, int64_t kernel_size) {
+at::Tensor build_subm_map(const at::Tensor& indices, int64_t kernel_size,
+                         const c10::optional<at::Tensor>& sorted_keys,
+                         const c10::optional<at::Tensor>& source_rows) {
   check_tensor(indices, "indices", at::kInt, 2);
   TORCH_CHECK(indices.size(1) == 4, "indices must have shape [N, 4]");
   TORCH_CHECK(indices.size(0) >= 1 && indices.size(0) <= 4096,
               "N must be in [1, 4096]");
   TORCH_CHECK(kernel_size == 1 || kernel_size == 3 || kernel_size == 5,
               "kernel_size must be 1, 3 or 5");
+  TORCH_CHECK(sorted_keys.has_value() == source_rows.has_value(),
+              "sorted_keys and source_rows must be both present or both absent");
+  if (sorted_keys.has_value()) {
+    check_tensor(*sorted_keys, "sorted_keys", at::kLong, 1);
+    check_tensor(*source_rows, "source_rows", at::kInt, 1);
+    TORCH_CHECK(sorted_keys->device() == indices.device() &&
+                    source_rows->device() == indices.device(),
+                "indices, sorted_keys and source_rows must be on the same device");
+    TORCH_CHECK(sorted_keys->size(0) >= 1 && sorted_keys->size(0) <= indices.size(0),
+                "M must be in [1, N]");
+    TORCH_CHECK(source_rows->size(0) == sorted_keys->size(0),
+                "source_rows must have the same M as sorted_keys");
+  }
   const int64_t volume = kernel_size * kernel_size * kernel_size;
   const c10::OptionalDeviceGuard guard(indices.device());
   auto neighbors = at::empty({indices.size(0), ((volume + 7) / 8) * 8},
                             indices.options());
-  at_npu::native::OpCommand()
-      .Name("BuildSubmMap")
-      .Input(indices, "indices")
-      .Output(neighbors, "neighbors")
+  at_npu::native::OpCommand command;
+  command.Name("BuildSubmMap").Input(indices, "indices");
+  if (sorted_keys.has_value()) {
+    command.Input(*sorted_keys, "sorted_keys").Input(*source_rows, "source_rows");
+  } else {
+    // CANN None descriptors preserve optional IR input slots 1 and 2.
+    command.Input().Input();
+  }
+  command.Output(neighbors, "neighbors")
       .Attr("kernel_size", kernel_size)
       .Run();
   return neighbors;
@@ -96,7 +116,8 @@ at::Tensor subm_conv3d_autograd(const at::Tensor& features,
 }  // namespace
 
 TORCH_LIBRARY(graspgenx_subm, module) {
-  module.def("build_subm_map(Tensor indices, int kernel_size) -> Tensor");
+  module.def("build_subm_map(Tensor indices, int kernel_size, "
+             "Tensor? sorted_keys=None, Tensor? source_rows=None) -> Tensor");
   module.def("subm_conv3d(Tensor features, Tensor neighbors, Tensor weight) -> Tensor");
 }
 

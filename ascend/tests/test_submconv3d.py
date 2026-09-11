@@ -1,8 +1,9 @@
-"""Run after build/environment setup: python test_submconv3d.py [-v].
+"""After build/environment setup: python -B ascend/tests/test_submconv3d.py [-v].
 
 Set SUBM_SMOKE=1 to include N=2048/3500/4096. No packages are installed or built here.
 Metrics go to stdout; latency includes Python/launch overhead, and the first
 compiled call includes compilation. Only cosine >= 0.9999 is a numeric gate.
+All-missing zero-output boundaries are checked separately, without cosine PASS.
 """
 
 import itertools
@@ -89,9 +90,23 @@ def reference_conv(features, indices, weight, bias, kernel_size):
     return output if bias is None else output + bias.float()
 
 
+def reference_map_conv(features, neighbors, weight):
+    """CPU FP32 oracle for raw supplied maps, not coordinate/builder semantics."""
+    features, weight = features.cpu().float(), weight.cpu().float()
+    neighbors = neighbors.cpu().long()
+    n = features.shape[0]
+    output = torch.zeros(n, weight.shape[2], dtype=torch.float32)
+    # Only weight K^3 columns are live; all out-of-range indices mean missing.
+    for column in range(weight.shape[0]):
+        sources = neighbors[:, column]
+        valid = (sources >= 0) & (sources < n)
+        output[valid] += features[sources[valid]] @ weight[column]
+    return output
+
+
 class SubMConvTests(unittest.TestCase):
     def test_platform_registration_artifacts(self):
-        root = Path(__file__).resolve().parent
+        root = Path(__file__).resolve().parents[1] / "custom_ops/submconv3d"
         tbe = root / "opp/vendors/graspgenx_subm/op_impl/ai_core/tbe"
         expected = {"BuildSubmMap": "build_subm_map", "SubmConv3d": "subm_conv3d"}
         for directory in (tbe / "config", tbe / "kernel/config"):
@@ -267,6 +282,81 @@ class SubMConvTests(unittest.TestCase):
             self.compare("asymmetric_raw_op", output, expected, K=kernel_size)
             self.compare("uncached_python_api", subm_conv3d(features, indices, weight,
                          kernel_size=kernel_size), expected, K=kernel_size)
+
+    @torch.no_grad()
+    def test_raw_supplied_maps_tile_boundaries(self):
+        cases = [(n, 16, cout, 3) for n in (15, 16, 17) for cout in (48, 64, 512)]
+        cases += [(17, 512, 64, 1), (15, 256, 48, 5), (17, 512, 48, 3)]
+        for n, cin, cout, kernel_size in cases:
+            with self.subTest(N=n, Cin=cin, Cout=cout, K=kernel_size):
+                generator = torch.Generator().manual_seed(701)
+                volume = kernel_size**3
+                features = torch.randn(n, cin, generator=generator).half()
+                weight = (torch.randn(volume, cin, cout, generator=generator)
+                          / math.sqrt(volume * cin)).half()
+                neighbors = torch.full((n, (volume + 7) // 8 * 8), -1, dtype=torch.int32)
+                neighbors[:, :volume] = torch.randint(-1, n, (n, volume), generator=generator)
+                # K=1 is deliberately not identity, and arbitrary maps may repeat sources.
+                neighbors[:, 0] = torch.arange(n).roll(1)
+                expected = reference_map_conv(features, neighbors, weight)
+                features, weight = features.to("npu"), weight.to("npu")
+                for poisoned in (False, True):
+                    if poisoned:
+                        poison = torch.tensor([0, n - 1, -2, -(2**31), n, 2**31 - 1, 0],
+                                              dtype=torch.int32)
+                        neighbors[:, volume:] = poison[:neighbors.shape[1] - volume]
+                    output = torch.ops.graspgenx_subm.subm_conv3d(
+                        features, neighbors.to("npu"), weight,
+                    )
+                    self.compare("raw_supplied_map", output, expected, N=n, Cin=cin,
+                                 Cout=cout, K=kernel_size, poisoned_padding=poisoned)
+
+    @torch.no_grad()
+    def test_raw_invalid_indices_are_missing(self):
+        n, cin, cout = 17, 32, 48
+        generator = torch.Generator().manual_seed(702)
+        features = torch.randn(n, cin, generator=generator).half()
+        for kernel_size in (1, 3, 5):
+            volume = kernel_size**3
+            weight = (torch.randn(volume, cin, cout, generator=generator)
+                      / math.sqrt(volume * cin)).half()
+            clean = torch.full((n, (volume + 7) // 8 * 8), -1, dtype=torch.int32)
+            clean[::2, :volume] = torch.randint(0, n, ((n + 1) // 2, volume), generator=generator)
+            expected = reference_map_conv(features, clean, weight)
+            npu_features, npu_weight = features.to("npu"), weight.to("npu")
+            for missing in (-2, -(2**31), n, 2**31 - 1):
+                with self.subTest(K=kernel_size, missing=missing):
+                    neighbors = clean.clone()
+                    neighbors[1::2, :volume] = missing
+                    output = torch.ops.graspgenx_subm.subm_conv3d(
+                        npu_features, neighbors.to("npu"), npu_weight,
+                    )
+                    self.compare("raw_invalid_index", output, expected,
+                                 K=kernel_size, missing=missing)
+
+    @torch.no_grad()
+    def test_raw_all_missing_zero_boundary(self):
+        n, cin, cout = 17, 16, 48
+        features = torch.ones(n, cin, dtype=torch.float16, device="npu")
+        missing = torch.tensor([-1, -2, -(2**31), n, 2**31 - 1], dtype=torch.int32)
+        for kernel_size in (1, 3, 5):
+            with self.subTest(K=kernel_size):
+                volume = kernel_size**3
+                # Valid, nonzero-feature rows in padding must not contribute either.
+                neighbors = torch.zeros(n, (volume + 7) // 8 * 8, dtype=torch.int32)
+                neighbors[:, :volume] = missing[torch.arange(n * volume).reshape(n, volume) % 5]
+                weight = torch.ones(volume, cin, cout, dtype=torch.float16, device="npu")
+                output = torch.ops.graspgenx_subm.subm_conv3d(features, neighbors.to("npu"), weight)
+                self.assertEqual(tuple(output.shape), (n, cout))
+                self.assertEqual(output.dtype, torch.float16)
+                self.assertEqual(output.device.type, "npu")
+                self.assertTrue(output.is_contiguous())
+                result = output.cpu()
+                self.assertTrue(torch.isfinite(result).all().item())
+                self.assertEqual(torch.count_nonzero(result).item(), 0)
+                print(json.dumps({"boundary": "all_missing_zero", "K": kernel_size,
+                                  "cosine": None, "numeric_gate": "not_applicable_zero_reference"}),
+                      flush=True)
 
     def test_module(self):
         indices_cpu = coordinates(17, 31)

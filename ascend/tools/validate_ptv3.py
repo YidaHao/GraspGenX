@@ -58,7 +58,7 @@ except ImportError:  # CPU baseline remains usable without torch-npu
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BASELINE_DIR = REPO_ROOT / "ascend/baselines/ptv3-cuda-fp32-eager"
 RESULT_DIR = REPO_ROOT / "ascend/results"
-EXPERIMENT_TAG = "ffn_resident"
+EXPERIMENT_TAG = "cpe_g4_mixed"
 POINT_COUNTS = (64, 2048, 3500)
 ENCODERS = ("generator", "discriminator")
 WARMUP_RUNS = 3
@@ -137,8 +137,7 @@ os.environ.setdefault("GRASPGENX_CHECKPOINT_DIR", str(BASELINE_DIR))
 install_minimal_import_shims()
 
 # Select exactly one import. Nothing else needs changing for a CPU control.
-# from graspgenx.models.ptv3.ptv3_ascend import PointTransformerV3Ascend as PointTransformerV3
-from graspgenx.models.ptv3.ptv3_ascend import PointTransformerV3Subm as PointTransformerV3
+from graspgenx.models.ptv3.ptv3_ascend import PointTransformerV3Ascend as PointTransformerV3
 # from graspgenx.models.ptv3.ptv3_vanilla import PointTransformerV3Vanilla as PointTransformerV3
 
 IMPLEMENTATION = PointTransformerV3.__module__
@@ -269,18 +268,22 @@ def run_case(
         candidate = output.detach().float().cpu().numpy()
         repeat_max_abs = []
         repeat_finite = True
+        repeat_shape_match = True
         for _ in range(REPEAT_CHECKS):
             repeated = model(model_input)
             synchronize()
             repeated_np = repeated.detach().float().cpu().numpy()
             repeat_finite = repeat_finite and bool(np.isfinite(repeated_np).all())
-            repeat_max_abs.append(float(np.abs(repeated_np - candidate).max()))
+            repeat_shape_match &= repeated_np.shape == golden.shape
+            if repeated_np.shape == candidate.shape:
+                repeat_max_abs.append(float(np.abs(repeated_np - candidate).max()))
 
     accuracy = compare(golden, candidate)
     repeatability = {
         "checks": REPEAT_CHECKS,
-        "max_abs": max(repeat_max_abs),
+        "max_abs": max(repeat_max_abs, default=None),
         "finite": repeat_finite,
+        "shape_match": repeat_shape_match,
         "report_only": True,
     }
     latency = summarize_ms(timings)
@@ -300,7 +303,7 @@ def run_case(
         "performance_target_ms": PER_ENCODER_TARGET_MS,
         "performance_target_passed": latency["median_ms"]
         <= PER_ENCODER_TARGET_MS,
-        "passed": accuracy["passed"] and repeat_finite,
+        "passed": accuracy["passed"] and repeat_finite and repeat_shape_match,
     }
 
 
@@ -314,13 +317,14 @@ def print_case(result: dict) -> None:
     accuracy = result["accuracy"]
     latency = result["latency"]
     repeatability = result["repeatability"]
+    repeat_text = "n/a" if repeatability["max_abs"] is None else f"{repeatability['max_abs']:.3e}"
     print(
         f"[{status}] {result['encoder']:13s} n={result['point_count']:4d} "
         f"max_abs={accuracy['max_abs']:.3e} "
         f"mean_abs={accuracy['mean_abs']:.3e} "
         f"rel_l2={accuracy['relative_l2']:.3e} "
         f"cosine={accuracy['cosine']:.8f} "
-        f"repeat={repeatability['max_abs']:.3e} "
+        f"repeat={repeat_text} "
         f"mean={latency['mean_ms']:.3f} ms "
         f"median={latency['median_ms']:.3f} ms "
         f"p95={latency['p95_ms']:.3f} ms "

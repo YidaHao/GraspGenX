@@ -24,7 +24,9 @@ static ge::graphStatus Tiling(gert::TilingContext* ctx) {
     data.set_cout(co);
     data.set_volume(kv);
     data.set_width(map.GetDim(1));
-    data.set_jobs((n + 15) / 16 * (co / 16));
+    const uint32_t channel_tiles = std::min<int64_t>(4, co / 16);
+    data.set_channel_tiles(channel_tiles);
+    data.set_jobs((n + 15) / 16 * ((co / 16 + channel_tiles - 1) / channel_tiles));
     platform_ascendc::PlatformAscendC platform(ctx->GetPlatformInfo());
     ctx->SetBlockDim(std::min<uint32_t>(data.get_jobs(), platform.GetCoreNumAic()));
     ctx->SetTilingKey(0);
