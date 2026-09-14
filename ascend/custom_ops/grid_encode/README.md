@@ -2,8 +2,10 @@
 
 Four-route integer spatial encoding for the current `PointTransformerV3Ascend`.
 The `GridEncode` branch starts from `eff0a76`; `ptv3_vanilla.py` remains the
-unchanged reference. Only initial spatial-code generation is replaced, not CPE
-or the dense feature path. This is not a fully NPU encoder.
+unchanged reference. GridEncode itself replaces only initial spatial-code
+generation, not CPE or the dense feature path. The model now also defaults to
+resident NPU FP16 CPE post-ops, documented separately below. This is not a fully
+NPU encoder.
 
 ## Raw Contract
 
@@ -49,8 +51,16 @@ model class or user-facing implementation switch.
 - CPU grid quantization, depth inference and the reference batch-bit budget stay unchanged.
 - Canonical CPU int32/int64 grids are uploaded as contiguous NPU int32; only spatial codes run in GridEncode.
 - Codes return to CPU for `[N, 4] -> [4, N]`, batch packing, default `argsort`, inverse and optional order shuffling.
-- Grid quantization and downsampling remain CPU FP32. The continuous NPU attention/residual/LayerNorm/FFN region remains FP16, with no feature FP32/upcast path.
-- CPE still uses CPU reference-hash representative selection and CPU post-ops, with NPU neighbor queries and FP16 sparse convolution.
+- Grid quantization and downsampling remain CPU FP32; the FFN exit still returns CPU FP32 at each block boundary.
+- CPE retains CPU reference-hash representative selection, NPU neighbor queries and the same FP16 sparse-convolution kernel. Supported blocks now upload CPU FP32 features once, then keep convolution/bias, CPE linear/LayerNorm/residual and attention/residual/LayerNorm/FFN in continuous NPU FP16 until the block exit.
+- Attention consumes resident FP16 features directly. There is no feature FP32/upcast path; Cube FP32 internal accumulation and unused FP32 LayerNorm mean/rstd statistics are allowed. Unsupported CPE shapes retain the old CPU FP32 formula.
+
+See [CPE post-ops integration and results](../submconv3d/README.md#cpe-postops)
+for the separate CPU-post-ops/NPU-post-ops comparison and accuracy changes.
+This adds no model class or user-facing flags and changes neither raw SubM nor
+GridEncode ABI/kernels. CPE packed FP16 buffers are nonpersistent; original CPE
+CPU parameters, checkpoint keys and reload hooks are preserved. Do not call
+`.npu()`, `.half()` or `.float()` on the entire mixed model.
 
 Noncanonical orders, unsupported grid shape/dtype/domain, negative coordinates
 and depth zero use reference CPU serialization handling. Existing reference
@@ -116,8 +126,11 @@ print(codes.cpu())  # int64 [3, 4], in the four documented column orders
 
 ## Recorded Validation
 
-These commands document the existing suites; no new run is implied by this
-README. After sourcing the package environment and building native artifacts:
+The measurements and byte-equality claims in this section are historical
+GridEncode validation with CPU FP32 CPE post-ops held fixed, not validation of
+the new FP16 post-ops candidate. These commands document the existing suites;
+no new run is implied by this README. After sourcing the package environment
+and building native artifacts:
 
 ```bash
 ASCEND_TEST_NPU=1 "$PYTHON_BIN" -B ascend/tests/test_grid_encode.py -v
@@ -148,7 +161,7 @@ finite outputs required; runtime failures cannot pass. Other errors, byte
 equality, repeat drift and latency are report-only. Frozen goldens are not
 replaced with candidate outputs.
 
-The separate P1 `validate_ptv3.py` run passed all six G/D cases, with repeat drift
+The historical P1 `validate_ptv3.py` run passed all six G/D cases, with repeat drift
 zero; the default N=2048 stage profiler also passed. Its serialization medians
 were 4.107/4.033 ms for G/D. The validator's G/D medians were 137.808/138.908 ms
 at N=2048 and 156.358/153.889 ms at N=3500, so the report-only 150 ms target is
@@ -158,18 +171,29 @@ Validator/profiler selection remains via direct imports and top-of-file
 configuration, not impl/device/precision CLI switches.
 
 The unified `SUBM_SMOKE=1 bash ascend/tests/run_tests.sh -v` runner loads both
-private packages and runs the three CPE suites plus both GridEncode suites in
-separate processes. Both packages must already be built. The final P1 unified
-run passed all 60 tests (12 + 10 + 11 + 11 + 16), with no skips; see
-`build/unified_validation.log` for the two-package coexistence regression.
+private packages, which must already be built. It now runs four CPE suites plus
+both GridEncode suites in separate processes: **71 tests passed on P1**, the original
+60 (12 + 10 + 11 + 11 + 16) plus 11 in `test_cpe_postops.py`. The historical P1
+60-test run passed without skips (`build/unified_validation.log`); this is not a
+71-test result. The new post-ops suite recorded P1 11/11 in 50.531 s and P3 11/11
+in about 13 s; P3 also passed the legacy CPE 11/11 in about 13 s. The final P1
+71-test run had no skips; its log is `../submconv3d/build/cpe_postops_unified.log`.
+The new default validator passed all six cases and the N=2048 stage profiler
+passed. The P1 validator tag is `cpe_postops_resident_fp16`; current FP16 post-ops
+accuracy/performance is documented in the linked CPE section, not the old tables below.
 
 ## Performance
 
 P1 N=2048 G+D: 377.704 -> 276.818 ms, -100.886 ms (-26.71%). P3: 96.907 ->
 77.501 ms, -19.406 ms (-20.03%). The control is original CPU initial serialization
-with current CPE/dense code fixed; the candidate uses four-route GridEncode.
+with the then-current CPE/dense code fixed; the candidate uses four-route GridEncode.
 Verdict: **improved on these measured workloads**, encoder-only, with only three
 processes per host and no statistical-significance claim.
+
+All tables below retain the historical GridEncode measurements, with **CPU FP32
+CPE post-ops in both variants**. They are not new CPE post-ops measurements or
+current-default latency claims; see the separate
+[CPE post-ops results](../submconv3d/README.md#cpe-postops).
 
 | Host | Points | Before | After | Change (ms) | Change (%) |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -180,8 +204,8 @@ processes per host and no statistical-significance claim.
 | P3 | 2048 | 96.907 | 77.501 | -19.406 | -20.03% |
 | P3 | 3500 | 123.542 | 99.301 | -24.241 | -19.62% |
 
-The control is `eff0a76`-based current optimized CPE/dense with benchmark-only
-original CPU serialization, not CPU-CPE. The same resident model switches only
+The control is `eff0a76`-based optimized CPE/dense with benchmark-only original
+CPU serialization and fixed CPU post-ops, not pure CPU-CPE. The same resident model switches only
 its bound serialization method in paired AB/BA order. Protocol: 3 independent
 processes, 3 warmups, 20 measured runs, 3 repeat checks, 16 CPU threads; 20
 serialization-entry/raw runs and 3 diagnostic profile runs at N=2048.
@@ -231,6 +255,8 @@ that baseline was not measured here. Default adoption still targets P1 first.
 - [P3 private three-process summary (SSH)](ssh://huawei@192.168.136.109/home/huawei/hyd/Workspace/GraspgenX/grid_encode_validation_20260911_aKpQaedG/ascend/results/grid_encode_compare_20260911_135746_664985/summary.json)
 
 Per-process JSON and raw NPZ outputs reside beside each summary. P3 links refer
-to the remote private checkout, not a local copy. Both summaries report PASS,
+to the remote private checkout, not a local copy. Both historical GridEncode summaries report PASS,
 exact metadata/raw codes, unchanged source/bridge/private OPP across processes,
-and equal old/new embedding bytes. No new measurements accompany this README.
+and equal old/new embedding bytes with CPU post-ops fixed. This does not imply
+byte equality for the new FP16 CPE post-ops. No new measurements were run for this
+README edit.

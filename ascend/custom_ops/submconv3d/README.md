@@ -146,34 +146,47 @@ Torch-NPU 单算子 `jit_compile` 与 TorchAir 图编译是不同开关。库本
 SUBM_SMOKE=1 bash ascend/tests/run_tests.sh -v
 ```
 
-Ascend 测试统一位于 `ascend/tests/`；入口自动加载 CPE 和 GridEncode 两个已构建的私有算子环境，依次在独立 Python 进程中运行三份 CPE 测试及两份 GridEncode 测试，并启用 NPU 用例。根目录 `tests/` 的通用/CUDA 测试不变。仅测试 CPE 或指定 unittest 用例时，仍可单独加载 CPE 环境：
+Ascend 测试统一位于 `ascend/tests/`；入口自动加载 CPE 和 GridEncode 两个已构建的私有算子环境，在独立 Python 进程中运行四份 CPE 测试及两份 GridEncode 测试，并启用 NPU 用例。新增 `test_cpe_postops.py` 11 项后，P1 六套共 71 项已全部通过，无跳过。根目录 `tests/` 的通用/CUDA 测试不变。仅测试 CPE 或指定 unittest 用例时，仍可单独加载 CPE 环境：
 
 ```bash
 source ascend/custom_ops/submconv3d/env.sh
 "$PYTHON_BIN" -B ascend/tests/test_build_subm_map.py -v
 "$PYTHON_BIN" -B ascend/tests/test_submconv3d.py SubMConvTests.test_platform_registration_artifacts -v
 PTV3_CPE_NPU=1 "$PYTHON_BIN" -B ascend/tests/test_ptv3_cpe.py -v
+ASCEND_TEST_NPU=1 "$PYTHON_BIN" -B ascend/tests/test_cpe_postops.py -v
 ```
 
 `SUBM_SMOKE=1` 额外覆盖 2048/3500/4096 点。builder 测试覆盖唯一坐标、代表行/碰撞、可选输入校验及 eager/TorchAir；CPE 测试覆盖缓存、checkpoint 和回退语义。map 须精确匹配；浮点数值门槛仅为 cosine >= 0.9999，形状错误、非有限输出或运行失败不能通过。其他误差、repeat drift 和延迟仅报告。测试也检查生成的 ACLNN SoC 支持表、op-info 和 kernel 目录，确认只包含当前声明的平台。
 
-截至 2026-09-10 本次文档更新，P1 最终原生构建及完整套件已完成：conv 12/12（532.893 s）、map 10/10（438.709 s）、CPE 11/11（78.016 s），日志为本算子包的 `build/final_{conv,map,cpe}_tests.log`。最终 K=5 扫描至 N=256 的版本已安装并通过测试。P3 CANN 8.3 的阈值调整前快照也已通过 conv 12/12、map 10/10、CPE 11/11；不代表 P3 已验证最终阈值。
+新增 post-ops 测试覆盖显式 FP16 算式、packed 权重/bias、CPU 原参数与 checkpoint keys/strict reload、CPU 控制替换、attention 两种入口、回退和特征复制边界。P1 六套统一回归已通过（12 + 10 + 11 + 11 + 11 + 16），日志为 `build/cpe_postops_unified.log`；P3 新套件和原 CPE 套件各 11/11（各约 13 s）。默认 validator 六组过线且 repeat=0，2048 点 G/D 中位数为 112.202/110.887 ms，3500 点为 122.122/122.863 ms，六组中位数均达到 150 ms 的报告目标，但不承诺尾延迟。默认 2048 点 profiler 也通过；这是单进程回归，不替代正式 A/B 数据。
 
-P1 真实模型 3 进程 x 20 样本比较及合并后的默认模型 validator 均已完成，G/D x 三种点数共六组全部通过 golden 精度门槛，最低 cosine 为 0.9999591909124736，repeat drift 为 0；合并后六组输出与本轮旧 SubM 控制逐位一致。默认 stage profiler 的 2048 点 G/D 检查也通过。P3 最低 cosine 为 0.9999688915。这些是 encoder 精度验证，不是完整抓取质量验证。
+默认 profiler 的额外 dtype 审计确认每 encoder 仅 14 次浮点 H2D 和 14 次 D2H，CPE/attention/FFN 可见特征均为 NPU FP16；NPU FP32 tensor 仅见于 14 个 AddLayerNorm 调用的 mean/rstd 统计量。Cube 的内部 FP32 累加属于 kernel 内实现，不在此 tensor 审计范围内。新结果分别为 `ascend/results/ptv3_ascend_cpe_postops_resident_fp16_validation.json` 和 `ascend/results/ptv3_ascend_cpe_postops_fp16_audit_20260912_175105_profile_n2048.json`。
 
-PTV3 的 SubM 接入统一为 `graspgenx/models/ptv3/ptv3_ascend.py` 中的 `PointTransformerV3Ascend`；`PointTransformerV3Subm` 已移除且无别名。CPE 默认是 **CPU 精确保留原 `.sort()` 代表行 + NPU `BuildSubmMap` 查询 + NPU FP16 `SubmConv3d`**。CPE 后处理及连续 NPU FP16 dense 区域不变。当前初始四路空间编码另由 [GridEncode](../grid_encode/README.md) 执行；网格化、depth、batch 拼接、排序/inverse、downsampling 和 Cin=3 stem 仍在 CPU，**不是全 NPU encoder**。
+历史记录（2026-09-10，CPU post-ops 时代）：P1 当轮原生构建及完整套件已完成：conv 12/12（532.893 s）、map 10/10（438.709 s）、CPE 11/11（78.016 s），日志为本算子包的 `build/final_{conv,map,cpe}_tests.log`。最终 K=5 扫描至 N=256 的版本已安装并通过测试。P3 CANN 8.3 的阈值调整前快照也已通过 conv 12/12、map 10/10、CPE 11/11；不代表 P3 已验证最终阈值。
 
-真实点云可有重复体素或 hash 碰撞，默认使用代表行分支而非独立唯一坐标分支。坐标/batch 超出 int32 时，模型先用 CPU reference map，再执行 NPU 卷积；不支持的卷积形状/N 则使用 CPU map+卷积。这是适配器显式回退，不是 CANN 自动提供 CPU kernel；NPU 运行异常不会静默重试 CPU。
+同一历史轮次的 P1 真实模型 3 进程 x 20 样本比较及合并后的默认模型 validator 均已完成，G/D x 三种点数共六组全部通过 golden 精度门槛，最低 cosine 为 0.9999591909124736，repeat drift 为 0；合并后六组输出与当轮旧 SubM 控制逐位一致。默认 stage profiler 的 2048 点 G/D 检查也通过。P3 最低 cosine 为 0.9999688915。这些是旧 CPU post-ops 路径的 encoder 精度验证，不是当前 FP16 post-ops 的逐位一致性或完整抓取质量验证。
+
+PTV3 的 SubM 接入统一为 `graspgenx/models/ptv3/ptv3_ascend.py` 中的 `PointTransformerV3Ascend`；`PointTransformerV3Subm` 已移除且无别名。用户已批准支持形状的 CPE post-ops 默认采用 NPU FP16，无新增模型类或用户开关。**CPU 原 `.sort()` hash 代表行选择 + NPU `BuildSubmMap` 查询 + G4 NPU FP16 卷积保持不变**；原始 SubM 算子包 ABI/kernel 未改变，仅模型适配器扩展驻留特征路径。
+
+每个支持的 block 数据流为：`CPU FP32 input -> 一次 H2D FP16 -> SubMCPEConv(NPU Half): raw conv + npu_bias -> F.linear(packed Half) -> npu_layer_norm_eval(packed Half) -> FP16 residual -> attention 直接使用 Half -> FP16 residual/LayerNorm/FFN -> CPU FP32 exit`。attention 的 CPU FP32 控制入口保留先 `prepare_indices`、后 H2D 的旧顺序；新 NPU FP16 入口不再复制特征。FFN 计算、返回 CPU FP32 的边界和 downsampling 均不变。
+
+`AscendBlock` 的四个 nonpersistent buffer 为 `cpe_linear_weight_npu`、`cpe_linear_bias_npu`、`cpe_norm_weight_npu`、`cpe_norm_bias_npu`；卷积另缓存 `npu_bias`，沿用 `npu_weight`。CPE 原参数保留 CPU FP32 对象和 checkpoint keys，构造及 load-state-dict post-hook 打包，forward 不临时重打包。`_pack_cpe_weights` 用 `getattr` 安全检查支持形状，允许 benchmark 替换 `CachedCPEConv` 后 strict reload。
+
+内部 `SubMCPEConv.forward` 支持 CPU FP32 -> CPU FP32 的旧语义（NPU raw conv 返回 CPU 后加原 bias），以及与卷积权重同设备的 NPU FP16 -> FP16（加 packed `npu_bias`）。前者供 CPU post-ops 控制使用，并非原始算子新增 CPU ABI。NPU 特征连续保持 FP16，不引入 FP32 feature/upcast；Cube 内部 FP32 累加及未使用的 LayerNorm FP32 mean/rstd 统计量不在此限制内。
+
+初始四路空间编码仍由 [GridEncode](../grid_encode/README.md) 执行；网格化与 downsampling 保持 CPU FP32，depth、batch 拼接、排序/inverse 和 Cin=3 stem 仍在 CPU，**不是全 NPU encoder**。`ptv3_vanilla.py` 保持 reference 不变。
+
+真实点云可有重复体素或 hash 碰撞，默认使用代表行分支而非独立唯一坐标分支。坐标/batch 超出 int32 时，模型先用 CPU reference map，再执行 NPU 卷积和 FP16 post-ops；不支持的卷积形状/N 则使用 CPU FP32 输入模式、CPU map+卷积及原 `feat + cpe_norm(cpe_linear(cpe))` 后处理公式。这是适配器显式回退，不是 CANN 自动提供 CPU kernel；NPU 运行异常不会静默重试 CPU。
 
 map 只在当前点云、当前 stage、单次前向内复用。缓存是内部行为，无构造参数、环境变量或 CLI 开关；默认支持形状依赖本自定义算子包。`validate_ptv3.py` 和 `profile_ptv3_stages.py` 仅通过注释/取消注释顶部直接 import 选择 Ascend 或 vanilla，配置保持在脚本顶部；构造混合模型后不要对整个模型调用 `.npu()`、`.half()` 或 `.float()`。
 
-以下标签仅用于 `ascend/tools/benchmark_ptv3_subm.py` 内部对照，不是模型 API 或独立模型类：
+以下标签仅用于 `ascend/tools/benchmark_ptv3_subm.py` 内部对照，不是模型 API 或独立模型类。脚本对全部三方案显式绑定旧 CPU FP32 post-ops，metadata 为 `cpe_post_ops=cpu_fp32_benchmark_control`，仅比较卷积/map 消融，不测当前默认 FP16 post-ops：
 
 | 标签 | CPE map / 卷积 |
 | --- | --- |
 | `current` | 缓存 CPU map + CPU FP32 卷积（控制，不是现行默认） |
 | `npu_subm` | CPU map + G4 NPU FP16 卷积 |
-| `mixed_subm` | 现行默认：CPU 代表行 + NPU 查询 + G4 NPU FP16 卷积 |
+| `mixed_subm` | 与默认相同的 CPU 代表行 + NPU 查询 + G4 NPU FP16 卷积，但 post-ops 固定 CPU |
 
 从仓库根目录运行三方案比较：
 
@@ -183,11 +196,51 @@ source ascend/custom_ops/grid_encode/env.sh
 "$PYTHON_BIN" ascend/tools/benchmark_ptv3_subm.py
 ```
 
-需要原有 `ascend/baselines/ptv3-cuda-fp32-eager/` 中两套权重和三份 reference NPZ。配置在脚本顶部，结果写入新的 `ascend/results/subm_compare_*` 目录，不覆盖 golden。三方案逐样本轮换顺序；`current` 也不是历史未缓存控制。测量是单对象、混合 eager、encoder-only，含每次前向的建图和传输，不是完整抓取流程。用户已明确选择 P1 优先采用现行默认，接受 P3 大点数回退，不主张普遍加速。
+需要原有 `ascend/baselines/ptv3-cuda-fp32-eager/` 中两套权重和三份 reference NPZ。配置在脚本顶部，结果写入新的 `ascend/results/subm_compare_*` 目录，不覆盖 golden。三方案逐样本轮换顺序；`current` 也不是历史未缓存控制。测量是单对象、混合 eager、encoder-only，含每次前向的建图和传输，不是完整抓取流程。默认采用仍以 P1 为先；历史 P3 大点数相对 CPU CPE 的回退不能用本轮不同控制的改善抵消。
+
+`ascend/tools/profile_cpe_ops.py` 同样仅用于 **CPU FP32 post-ops 控制**的 snapshot/replay/分项及 in-model 调试，不代表当前 FP16 candidate，分项和也不是整体延迟。测量当前 post-ops 改动应在上述环境中运行 `"$PYTHON_BIN" ascend/tools/benchmark_cpe_postops.py`：同一驻留模型仅切换 `forward_cpe` 的 CPU 控制/默认 NPU 路径，输出 `ascend/results/cpe_postops_compare_*/`，不覆盖 golden。
 
 ## 6. 手段与结果
 
-以下为加入 GridEncode 前的历史 CPE 数据，保留原记录。当前重跑会对所有 CPE 控制统一使用新默认空间编码，不能将不同批次的绝对延迟差直接归因于 CPE。
+<a id="cpe-postops"></a>
+
+### CPE post-ops 手段与结果
+
+P1 G+D、N=2048：旧 CPU FP32 post-ops 控制 280.862 -> 默认 NPU FP16 post-ops 223.002 ms，-57.859 ms（-20.60%）；P3：77.977 -> 70.379 ms，-7.597 ms（-9.74%）。范围为单对象 encoder-only、同步 host wall time 含传输，非完整请求；结论：本轮中位数改善，但仅各 3 进程、每 case/variant 60 个计时样本，不主张统计显著性或尾延迟全面改善。
+
+手段是把卷积 bias、CPE linear、LayerNorm 和 residual 放入驻留 NPU FP16 区域，让 attention 直接使用结果，消除中途特征回传/再次上传。CPU reference map 语义、NPU 查询/卷积 kernel、GridEncode、dense 计算和 FFN exit/downsampling 固定。
+控制是旧 **NPU 卷积 + CPU FP32 post-ops**，不是纯 CPU CPE；本轮不能回答相对纯 CPU CPE 的收益。
+
+| 设备 / N | CPU post-ops ms | NPU post-ops ms | 变化 ms | 变化 % |
+| --- | ---: | ---: | ---: | ---: |
+| P1 / 64 | 215.756 | 173.091 | -42.665 | -19.77% |
+| P1 / 2048 | 280.862 | 223.002 | -57.859 | -20.60% |
+| P1 / 3500 | 313.121 | 246.439 | -66.682 | -21.30% |
+| P3 / 64 | 46.841 | 41.692 | -5.149 | -10.99% |
+| P3 / 2048 | 77.977 | 70.379 | -7.597 | -9.74% |
+| P3 / 3500 | 99.361 | 90.760 | -8.601 | -8.66% |
+
+每个 encoder 使用同一驻留模型，只重绑定 `forward_cpe`；每设备 3 独立进程、CPU 16 线程，warmup 3 / 测量 20 / repeat 3，按 run/process 交替 AB/BA。
+G+D 为**每进程 G/D encoder 中位数之和再取中位数**，独立聚合的 G、D 中位数不必相加等于此表。差值/百分比由未舍入 JSON 计算；表内时间保留 3 位小数。
+N=2048 另有每进程、每 encoder/variant 3 次分阶段 profile；分项计时仅作诊断，不能相加替代完整 encoder wall time。
+
+每设备 972 个输出（936 direct，含 warmup/测量/repeat；36 profile）均通过 CUDA golden gate；另 36 次 profile/direct 比较也通过且 max abs 为 0。要求形状 `[1,512]`、有限值、cosine >= 0.9999，运行失败不能通过。
+
+| 设备 | CPU 控制最低 CUDA cosine | NPU candidate 最低 CUDA cosine | Candidate 最大 CUDA abs error | Repeat max abs |
+| --- | ---: | ---: | ---: | ---: |
+| P1 | 0.9999591909124736 | 0.9999510227078675 | 0.0369681 | 0 |
+| P3 | 0.9999688914724082 | 0.9999525076094965 | 0.0367813 | 0 |
+
+FP16 post-ops 会改变误差，candidate 不与旧控制逐位一致；两者最大 abs 差分别为 P1 0.0138216、P3 0.0243397。除约定 cosine gate 外的误差、repeat drift 和延迟均仅报告。
+所有长尾保留，合并每 case/variant 的 60 样本后，两设备各组 P95 均改善，但 P3 G/64 的 P99/max 为 24.368/24.454 -> 25.338/26.533 ms，P3 D/3500 为 50.693/50.790 -> 51.819/59.255 ms，均回退。
+P1 G/2048 的 max 也从 154.889 -> 167.313 ms。60 样本不足以稳定估计尾部；P3 原有约占一个 CPU 核的 glob 搜索及桌面负载未被终止，视为用户活动和潜在噪声，不剔除相应样本。
+
+复制结构测试显示每 encoder 14 个支持 block：控制 28 H2D + 28 D2H，candidate 14 + 14，且无 forward 参数重打包。这是浮点特征的 Python dispatch 计数，**不是 DMA/kernel 次数**，整数 metadata 复制不在此计数内；不得以此或 kernel/TransData 数量代替整体性能测量。
+
+- [P1 三进程原始汇总](../../results/cpe_postops_compare_20260912_170605_032812/summary.json)
+- [P3 私有三进程原始汇总（SSH）](ssh://huawei@192.168.136.109/home/huawei/hyd/Workspace/GraspgenX/cpe_postops_validation_20260912_loQWePSS/ascend/results/cpe_postops_compare_20260912_171258_329608/summary.json)
+
+以下各表及 G2/G4/唯一坐标建图记录均为加入 GridEncode 前、CPU post-ops 时代的历史 CPE 数据，原值保留；其中“默认”指当时的默认。当前卷积/map benchmark 对所有方案固定 CPU post-ops、统一使用 GridEncode，不能将不同批次的绝对延迟差归因于本轮 post-ops。
 
 ### 默认路径三方案比较
 
