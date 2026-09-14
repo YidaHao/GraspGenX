@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Replay real CPE blocks with the existing CANN/OPP environment; no CLI/build.
+"""Benchmark-only CPU FP32 CPE post-ops replay, NOT the default FP16 candidate.
 
-For paired old/new runs, keep FROZEN_INPUT_DIR fixed and change RUN_TAG. Optional
-traces replay the same fixtures, separately from warm component wall timings.
+Snapshots, replay and in-model timings all bind the original CPU post-ops;
+maps/convolution, serialization/GridEncode and FFN keep the current model path.
+Use the existing CANN/OPP environment; no CLI/build. For paired control runs,
+keep FROZEN_INPUT_DIR fixed and change RUN_TAG. Optional traces replay the same
+fixtures, separately from warm component wall timings.
 """
 
 import json
@@ -11,7 +14,10 @@ import platform
 import sys
 import time
 from datetime import datetime
+from contextlib import ExitStack
 from pathlib import Path
+from types import MethodType
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -20,21 +26,23 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BASELINE_DIR = REPO_ROOT / "ascend/baselines/ptv3-cuda-fp32-eager"
 RESULT_ROOT = REPO_ROOT / "ascend/results"
 OP_ROOT = REPO_ROOT / "ascend/custom_ops/submconv3d"
-RUN_TAG = "gather_g4_mixed"
+RUN_TAG = "cpu_postops_control_breakdown"
 FROZEN_INPUT_DIR = None  # Set an earlier cpe_ops_* directory for fixed-input comparisons.
 PROFILE = False  # Same FROZEN_INPUT_DIR + different RUN_TAG pairs old/new traces.
 PROFILE_RUNS = 2
 MEASURE_MIXED_MAP = True
-POINT_COUNTS = (64, 2048, 3500)
+POINT_COUNTS = (2048,)
 ENCODERS = ("generator", "discriminator")
-CPU_THREADS, WARMUP, SAMPLES = 16, 2, 10
+CPU_THREADS, WARMUP, SAMPLES = 16, 3, 20
 COSINE_GATE = 0.9999
 MAP_COMPONENTS = ("cpu_full_map", "cpu_packed_map_upload")
 BLOCK_COMPONENTS = ("features_h2d", "resident_subm_conv3d", "d2h", "cpu_postops")
+POSTOP_COMPONENTS = ("cpu_bias", "cpu_linear", "cpu_layer_norm", "cpu_residual")
 
 sys.path.insert(0, str(REPO_ROOT))
-from ascend.tools import validate_ptv3 as validation  # Install shims before model imports.
-from graspgenx.models.ptv3.ptv3_ascend import CachedCPEConv, PointTransformerV3Ascend
+from ascend.benchmark import validate_ptv3 as validation  # Install shims before model imports.
+from ascend.benchmark.benchmark_cpe_postops import cpu_cpe_control
+from graspgenx.models.ptv3.ptv3_ascend import CachedCPEConv, PointTransformerV3Ascend, VanillaPoint
 import torch_npu
 
 
@@ -73,7 +81,7 @@ def benchmark_block(block, snapshot, trace_dir):
     oracle.bias = None  # Raw kernel has no bias; source's CPU bias remains unchanged.
     n, cin = feat.shape
     volume, weight_cin, cout = source.weight.shape
-    assert feat.dtype == torch.float32 and cin == weight_cin
+    assert feat.device.type == "cpu" and feat.dtype == torch.float32 and cin == weight_cin
     assert grid.shape == (n, 3) and batch.shape == (n,)
     assert grid.dtype in (torch.int32, torch.int64) and batch.dtype == torch.int64
     assert 1 <= n <= 4096 and source.kernel_size in (1, 3, 5) and volume == source.kernel_size**3
@@ -111,6 +119,9 @@ def benchmark_block(block, snapshot, trace_dir):
 
         mixed, metrics["mixed_map_total"] = measure(mixed_map, npu=True)
         assert torch.equal(mixed.cpu(), packed.cpu()), "mixed pipeline changed reference map"
+    control_map, metrics["control_map_total"] = measure(
+        lambda: source._get_npu_map(grid, batch, {}), npu=True)
+    assert torch.equal(control_map.cpu(), packed.cpu()), "control map changed reference indices"
     features, metrics["features_h2d"] = measure(lambda: feat.to("npu:0", torch.float16), npu=True)
     weight = source.npu_weight
     assert weight is not None and torch.equal(weight.cpu(), source.weight.half())
@@ -131,6 +142,24 @@ def benchmark_block(block, snapshot, trace_dir):
         return feat + block.cpe_norm(block.cpe_linear(biased))
 
     post, metrics["cpu_postops"] = measure(postops)
+    biased, metrics["cpu_bias"] = measure(lambda: actual if source.bias is None else actual + source.bias)
+    projected, metrics["cpu_linear"] = measure(lambda: block.cpe_linear(biased))
+    normalized, metrics["cpu_layer_norm"] = measure(lambda: block.cpe_norm(projected))
+    residual, metrics["cpu_residual"] = measure(lambda: feat + normalized)
+    accuracy["split_postops_bit_exact"] = torch.equal(residual, post)
+    assert accuracy["split_postops_bit_exact"], "split post-ops changed CPU arithmetic"
+
+    point = VanillaPoint(feat=feat, grid_coord=grid, batch=batch,
+                         coord=snapshot["point_coord"], offset=snapshot["point_offset"])
+    source._get_npu_map(grid, batch, point)
+
+    def cached_cpe():
+        point.feat = feat
+        return block.forward_cpe(point).feat
+
+    replayed, metrics["control_cpe_cached_map"] = measure(cached_cpe, npu=True)
+    accuracy["control_cpe_bit_exact"] = torch.equal(replayed, post)
+    assert accuracy["control_cpe_bit_exact"], "CPU-postops control CPE differs from split replay"
     accuracy["postops_valid"] = post.shape == feat.shape and bool(torch.isfinite(post).all())
     accuracy["passed"] &= accuracy["postops_valid"]
     coords = torch.cat((batch[:, None], grid.long()), dim=1)
@@ -165,7 +194,70 @@ def benchmark_block(block, snapshot, trace_dir):
                 torch.npu.synchronize()
                 profiler.step()
     return {"shape": [n, cin, cout], "kernel_size": source.kernel_size,
-            "geometry": geometry, "accuracy": accuracy, "components": metrics}
+             "geometry": geometry, "accuracy": accuracy, "components": metrics}
+
+
+def replay_cpe(blocks, snapshots):
+    """CPU-postops control: one fresh map/stage, frozen features reset per block."""
+    points, outputs = {}, {}
+    for name, block in blocks.items():
+        snapshot = snapshots[name]
+        stage = name.rsplit(".", 1)[0]
+        if stage not in points:
+            points[stage] = VanillaPoint(
+                feat=snapshot["feat"], grid_coord=snapshot["grid"], batch=snapshot["batch"],
+                coord=snapshot["point_coord"], offset=snapshot["point_offset"])
+        point = points[stage]
+        point.feat = snapshot["feat"]
+        outputs[name] = block.forward_cpe(point).feat
+    return outputs
+
+
+def measure_in_model(model, data, blocks, golden):
+    """Time the bound CPU-postops control in full forward, without extra syncs."""
+    current, calls, samples = {}, {}, []
+
+    def wrap(original, label):
+        def timed(*args, **kwargs):
+            started = time.perf_counter()
+            result = original(*args, **kwargs)
+            current[label] = (time.perf_counter() - started) * 1000
+            calls[label] = calls.get(label, 0) + 1
+            return result
+        return timed
+
+    with ExitStack() as stack:
+        for name, block in blocks.items():
+            for module, method, component in (
+                (block, "forward_cpe", "cpe_total"),
+                (block.cpe_conv, "forward", "conv_map_bias_transfers"),
+                (block.cpe_linear, "forward", "cpu_linear"),
+                (block.cpe_norm, "forward", "cpu_layer_norm"),
+            ):
+                stack.enter_context(patch.object(module, method, wrap(getattr(module, method), f"{name}/{component}")))
+        for step in range(WARMUP + SAMPLES):
+            current.clear()
+            calls.clear()
+            output = model(data)
+            torch.npu.synchronize()
+            accuracy = validation.compare(golden, output.cpu().numpy())
+            assert accuracy["passed"], "in-model measurement failed CUDA gate"
+            assert len(calls) == 4 * len(blocks) and all(n == 1 for n in calls.values())
+            if step >= WARMUP:
+                samples.append(dict(current))
+    components = ("cpe_total", "conv_map_bias_transfers", "cpu_linear", "cpu_layer_norm")
+    totals = {key: [sum(v for label, v in sample.items() if label.endswith(f"/{key}"))
+                    for sample in samples] for key in components}
+    totals["cpu_residual_and_wrapper"] = [
+        total - conv - linear - norm for total, conv, linear, norm in zip(*(totals[k] for k in components))]
+    return {
+        "scope": "CPU FP32 post-ops control full-forward methods wrapped, NOT default FP16 CPE; no extra per-component NPU sync; CPU-returning conv includes map/transfers/bias",
+        "overhead": "Python timer wrappers included; residual remainder includes wrappers, not only tensor addition",
+        "cuda_accuracy_last": accuracy,
+        "components": {key: {**validation.summarize_ms(values), "samples_ms": values} for key, values in totals.items()},
+        "blocks": {label: validation.summarize_ms([sample[label] for sample in samples]) for label in samples[0]},
+        "samples_ms": samples,
+    }
 
 
 @torch.inference_mode()
@@ -174,7 +266,8 @@ def main():
     destination = RESULT_ROOT / f"cpe_ops_{datetime.now():%Y%m%d_%H%M%S_%f}_{RUN_TAG}"
     destination.mkdir(parents=True, exist_ok=False)
     fixture_root = Path(FROZEN_INPUT_DIR).resolve() if FROZEN_INPUT_DIR is not None else destination
-    sources = [Path(__file__), Path(validation.__file__), OP_ROOT / "submconv3d.py", OP_ROOT / "torch_bridge.cpp"]
+    sources = [Path(__file__), Path(validation.__file__), Path(cpu_cpe_control.__code__.co_filename).resolve(),
+               OP_ROOT / "submconv3d.py", OP_ROOT / "torch_bridge.cpp"]
     sources += list((REPO_ROOT / "graspgenx/models/ptv3").glob("ptv3_*.py"))
     sources += list(OP_ROOT.glob("op_*/*.cpp")) + list(OP_ROOT.glob("op_*/*.h"))
     opp_roots = [Path(p) for p in os.environ.get("ASCEND_CUSTOM_OPP_PATH", "").split(":") if p]
@@ -189,14 +282,21 @@ def main():
               "contract": {"encoders": ENCODERS, "point_counts": POINT_COUNTS, "threads": CPU_THREADS,
                            "warmup": WARMUP, "samples": SAMPLES, "cosine_gate": COSINE_GATE,
                             "profile_runs": PROFILE_RUNS if PROFILE else 0, "builder_called": MEASURE_MIXED_MAP,
-                           "control": "CPU vanilla hash map + packed upload; resident raw SubM FP16; CPU FP32 postops",
+                            "path_scope": "benchmark-only CPU FP32 CPE post-ops in snapshots/replay/in-model timing, NOT the default FP16 candidate",
+                            "cpe_post_ops": "cpu_fp32_benchmark_control",
+                            "control": "CPU full-map/packed-upload is a separate diagnostic alternative; control_map uses the unchanged model NPU-map helper",
+                            "unchanged": "current serialization/GridEncode, attention and FFN including CPU FP32 FFN exit",
                            "timing": "diagnostic warm wall ms, not end-to-end/device-only; CPU no sync; NPU pre-sync excluded/post-sync included",
                            "overhead": "no-op timer/sync probes reported, not subtracted; host dispatch/allocation included",
                            "transfers": "H2D includes FP32->FP16; D2H includes FP16->FP32; packed upload includes CPU packing",
                            "cpu_postops": "original bias + cpe_linear + cpe_norm (LayerNorm) + feat residual, CPU FP32",
                            "excluded": "model load, snapshot inference, weight upload, oracle, profiler, cold graph time",
-                           "weighting": "first block map+pack once/stage; transfers/kernel/postops each block; sorted prep separate"}}
+                            "weighting": "control map once/stage + transfers/kernel/postops each block; CPU-map diagnostic separate",
+                            "postops_substeps": "separate replay medians; not added again to cpu_postops",
+                            "control_replay": "14 CPU-postops CPE calls with original feature snapshots, fresh 5 stage maps per replay; cached-map block timings exclude map creation; excludes intervening attention/FFN",
+                            "snapshot_accuracy": {}}}
     print(f"Results: {destination}", flush=True)
+    controls = ExitStack()
     try:
         report["baseline_sha256"] = {f: validation.sha256_file(BASELINE_DIR / f) for f in validation.EXPECTED_SHA256}
         assert report["baseline_sha256"] == validation.EXPECTED_SHA256
@@ -213,30 +313,38 @@ def main():
                 if hasattr(module, "traceable"):
                     module.traceable = False
             model.eval()
+            model.execution_config["cpe_post_ops"] = "cpu_fp32_benchmark_control"
             report["execution_config"] = model.execution_config
             if "overhead_ms" not in report:
                 report["overhead_ms"] = {"cpu_noop": measure(lambda: None)[1],
                                          "npu_noop_sync": measure(lambda: None, npu=True)[1]}
             blocks = {name: block for name, block in model.named_modules() if hasattr(block, "cpe_conv")}
+            for block in blocks.values():
+                controls.enter_context(patch.object(block, "forward_cpe", MethodType(cpu_cpe_control, block)))
             for count in POINT_COUNTS:
                 snapshots, hooks = {}, []
                 for name, block in blocks.items():
                     def capture(module, args, name=name):
-                        feat, grid, batch, point = args
+                        _, grid, batch, point = args
                         # Freeze point geometry too, never retain its mutable object or map cache.
-                        values = dict(feat=feat, grid=grid, batch=batch, point_coord=point.coord, point_offset=point.offset)
+                        values = dict(feat=point.feat, grid=grid, batch=batch, point_coord=point.coord, point_offset=point.offset)
                         snapshots[name] = {key: value.detach().cpu().clone() for key, value in values.items()}
                     hooks.append(block.cpe_conv.register_forward_pre_hook(capture))
                 try:
                     with np.load(BASELINE_DIR / f"reference_n{count}.npz", allow_pickle=False) as reference:
-                        output = model(validation.make_input(reference))  # One untimed snapshot inference per case.
+                        data = validation.make_input(reference)
+                        output = model(data)  # One untimed snapshot inference per case.
+                        expected_embedding = reference[f"{encoder}_embedding"].copy()
                     torch.npu.synchronize()
                     assert output.shape == (1, 512) and torch.isfinite(output).all()
+                    snapshot_accuracy = validation.compare(expected_embedding, output.cpu().numpy())
+                    assert snapshot_accuracy["passed"], "snapshot inference failed CUDA gate"
+                    report["contract"]["snapshot_accuracy"][f"{encoder}_n{count}"] = snapshot_accuracy
                 finally:
                     for hook in hooks:
                         hook.remove()
                 assert snapshots.keys() == blocks.keys() and snapshots
-                case_rows, stages = [], {}
+                case_rows, stages, replay_inputs = [], {}, {}
                 for name, live in snapshots.items():
                     assert all(torch.isfinite(value).all() for value in live.values()), name
                     fixture = fixture_root / f"{encoder}_n{count}_{name}.npz"
@@ -251,6 +359,7 @@ def main():
                         with fixture.open("xb") as stream:
                             np.savez(stream, **{key: value.numpy() for key, value in snapshot.items()})
                     assert all(torch.isfinite(value).all() for value in snapshot.values()), name
+                    replay_inputs[name] = snapshot
                     stage = name.rsplit(".", 1)[0]
                     if stage in stages:
                         assert all(torch.equal(snapshot[k], stages[stage][0][k]) for k in ("grid", "batch")), stage
@@ -263,22 +372,51 @@ def main():
                     report["blocks"].append(row)
                 weighted = {key: sum(row["components"][key]["median_ms"] for row in
                                     ([entry[1] for entry in stages.values()] if key in MAP_COMPONENTS else case_rows))
-                            for key in (*MAP_COMPONENTS, *BLOCK_COMPONENTS)}
+                             for key in (*MAP_COMPONENTS, *BLOCK_COMPONENTS)}
+                control = {key: weighted[key] for key in BLOCK_COMPONENTS}
+                control["control_map_total"] = sum(
+                    entry[1]["components"]["control_map_total"]["median_ms"] for entry in stages.values())
+                postops_parts = {key: sum(row["components"][key]["median_ms"] for row in case_rows)
+                                 for key in POSTOP_COMPONENTS}
+                replayed, replay_timing = measure(
+                    lambda blocks=blocks, replay_inputs=replay_inputs: replay_cpe(blocks, replay_inputs), npu=True)
+                # Compare the untimed full replay with the same raw convolution and CPU post-ops.
+                for name, result in replayed.items():
+                    snapshot = replay_inputs[name]
+                    block = blocks[name]
+                    expected = snapshot["feat"] + block.cpe_norm(block.cpe_linear(block.cpe_conv(
+                        snapshot["feat"], snapshot["grid"], snapshot["batch"], {})))
+                    assert torch.equal(result, expected), (name, "stage-cache replay changed result")
+                in_model = measure_in_model(model, data, blocks, expected_embedding)
                 report["weighted"].append({"encoder": encoder, "point_count": count, "component_medians_ms": weighted,
-                                            "diagnostic_sum_not_end_to_end_ms": sum(weighted.values()),
+                                             "diagnostic_sum_not_end_to_end_ms": sum(weighted.values()),
+                                            "diagnostic_sum_scope": "CPU-full-map + CPU-postops diagnostic, NOT the current default candidate",
+                                            "control_components_ms": control,
+                                            "control_component_sum_not_end_to_end_ms": sum(control.values()),
+                                            "cpu_postops_substeps_ms": postops_parts,
+                                            "control_replay": replay_timing,
+                                            "in_model": in_model,
                                             "mixed_map_once_per_stage_ms": sum(
                                                 entry[1]["components"]["mixed_map_total"]["median_ms"] for entry in stages.values()) if MEASURE_MIXED_MAP else None,
                                            "map_stage_blocks": [entry[1]["block"] for entry in stages.values()],
                                            "sorted_prep_once_per_stage_excluded_ms": sum(
                                                 entry[1]["components"]["cpu_sorted_representatives"]["median_ms"] for entry in stages.values())})
-                print(json.dumps(report["weighted"][-1]), flush=True)
+                print(json.dumps({"encoder": encoder, "N": count, "cpe_post_ops": "cpu_fp32_benchmark_control",
+                                  "control_components_ms": control,
+                                  "postops_isolated_substeps_ms": postops_parts,
+                                  "replay_median_ms": replay_timing["median_ms"],
+                                  "in_model_medians_ms": {key: value["median_ms"] for key, value in in_model["components"].items()}}), flush=True)
+            controls.close()  # Restore class lookup and break bound-method self-cycles.
             del blocks, model
         report["completed"] = True
+        assert all(fingerprint(Path(path))["sha256"] == before["sha256"]
+                   for path, before in {**report["sources"], **report["artifacts"]}.items()), "source/artifact changed during measurement"
         report["passed"] = all(row["accuracy"]["passed"] for row in report["blocks"])
     except Exception as exc:
         report["error"] = repr(exc)
         raise
     finally:
+        controls.close()
         with (destination / f"summary_{RUN_TAG}.json").open("x") as stream:
             json.dump(report, stream, indent=2, allow_nan=False)
             stream.write("\n")

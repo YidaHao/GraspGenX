@@ -70,7 +70,7 @@ def sources():
             run_name=f"{MODEL_PACKAGE}.ptv3_ascend"))
         sys.modules[f"{MODEL_PACKAGE}.ptv3_ascend"] = ascend
         profiler = SimpleNamespace(**runpy.run_path(str(
-            REPO_ROOT / "ascend/tools/profile_ptv3_stages.py")))
+            REPO_ROOT / "ascend/benchmark/profile_ptv3_stages.py")))
     return SimpleNamespace(vanilla=vanilla, ascend=ascend, profiler=profiler)
 
 
@@ -254,6 +254,7 @@ class PTV3GridEncodeCPUTests(_SerializationChecks):
         model.enc = torch.nn.Identity()
         model.projection = torch.nn.Identity()
         model.forward = MethodType(production.forward, model)
+        model.pool_features = production.pool_features
         bound_serialize = MethodType(production.serialize_point, model)
         points = []
 

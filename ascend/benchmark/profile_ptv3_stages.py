@@ -9,9 +9,8 @@ Prerequisites
 -------------
 Run from the GraspGenX repository after loading CANN::
 
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh
-    export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-    python3 ascend/tools/profile_ptv3_stages.py
+    source ascend/env.sh
+    python3 ascend/benchmark/profile_ptv3_stages.py
 
 The following files must exist under ``BASELINE_DIR``::
 
@@ -24,11 +23,16 @@ kappa. ``USE_CUDA_GOLDEN=False`` selects synthetic inputs and random weights;
 device placement still follows the selected implementation import.
 
 Select the implementation by commenting/uncommenting the imports below.
-Ascend keeps attention/residual/norm/FFN on NPU FP16; vanilla uses CPU FP32.
-Result names follow the import. For the resident block, attention timing covers
-H2D, norm1 and attention; FFN timing covers add/norm2, FFN, residual and D2H.
-Compare their combined time across implementations, since these boundaries
+Ascend keeps supported CPE post-ops and attention/residual/norm/FFN on NPU FP16.
+Result names follow the import. CPE includes feature H2D and fused norm1;
+attention consumes the normalized tensor without another upload. FFN covers
+add/norm2, FFN, residual and D2H. Compare CPE+attention+FFN across versions, since these boundaries
 differ from vanilla. Profile timings include per-stage synchronization overhead.
+Canonical N>=1024 serialization also queues the first CPE map. Its stage barrier
+waits for that query, so only direct-forward timings measure overlap with CPU stem.
+Optional device/dtype auditing and the pooled-coordinate perturbation run only
+after timing, in separate diagnostic forwards. Their operator counts are not
+device kernel counts and their execution time is not part of the stage samples.
 """
 
 from __future__ import annotations
@@ -48,6 +52,8 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_flatten
 
 try:
     import torch_npu  # noqa: F401
@@ -62,14 +68,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BASELINE_DIR = REPO_ROOT / "ascend/baselines/ptv3-cuda-fp32-eager"
 POINT_COUNT = 2048
 RESULT_DIR = REPO_ROOT / "ascend/results"
-EXPERIMENT_TAG = "grid_encode_four_orders"
+EXPERIMENT_TAG = f"performance_{time.strftime('%Y%m%d_%H%M%S')}"
 
 USE_CUDA_GOLDEN = True
 ENCODERS = ("generator", "discriminator")
-WARMUP_RUNS = 1
+WARMUP_RUNS = 3
 PROFILE_RUNS = 20
-CPU_THREADS = 16
+CPU_THREADS = 14
 RANKING_TABLE_LIMIT = 100
+AUDIT_EXECUTION = True  # Separate, untimed forward; never included in stage samples.
+PROBE_POOLED_COORDINATES = True  # Diagnostic perturbation, not an optimization.
 
 GRID_SIZE = 0.01
 KAPPA = 3.27
@@ -188,17 +196,24 @@ def summarize_ms(values: list[float]) -> dict[str, float | int]:
 
 
 OPTIMIZATION_DIRECTIONS = {
-    "attention": "优化 QKV/softmax/gather，避免不必要的 FP32 upcast",
-    "cpe": "缓存邻接索引，融合 hash-conv/linear/norm",
-    "ffn": "融合 Linear-GELU-Linear；当前优先级较低",
-    "serialization": "缓存四路 code/order/inverse，避免重复排序",
-    "downsample": "缓存 unique/cluster/argsort 结果，减少动态索引重建",
-    "embedding": "优化 stem 的 hash lookup 与加权聚合",
-    "transfer": "合并 CPU/NPU 往返，静态索引一次性传输",
+    "attention": "支持形状为 BSH PFA，其余为 FP16 matmul；核对布局及索引",
+    "cpe": "Linear 已折叠进卷积；含 FP16 后处理及融合 norm1，首 stage 建图已前置",
+    "ffn": "已有 FFN/add-norm 融合；计时含末端 D2H",
+    "serialization": "含 GridEncode、CPU 网格/batch/排序，以及首 stage CPE 建图预取",
+    "downsample": "拆分整数分组与 FP32 投影/归约；核对未消费的坐标均值",
+    "embedding": "CPU FP32 K=5/Cin=3 stem；现有 SubM 不直接支持 Cin=3",
+    "transfer": "浮点及索引传输嵌在各阶段，不能仅看独立 transfer 类别",
     "pooling": "使用固定 batch reduction；当前优先级较低",
     "projection": "不是当前热点，暂不优先优化",
     "other": "保留到下一轮 stage 诊断",
 }
+if PointTransformerV3.__name__ != "PointTransformerV3Ascend":
+    OPTIMIZATION_DIRECTIONS.update({
+        "attention": "区分 CPU 索引、特征计算、布局和传输成本",
+        "cpe": "检查索引复用，分开建图、卷积和后处理",
+        "ffn": "核对当前精度、融合与设备边界",
+        "serialization": "区分网格、空间编码、排序和 inverse 开销",
+    })
 
 
 def stage_category(stage_name: str) -> str:
@@ -491,6 +506,67 @@ def load_input() -> tuple[dict, dict[str, np.ndarray]]:
     return data, golden
 
 
+def tensor_spec(value):
+    return {"shape": list(value.shape), "device": str(value.device), "dtype": str(value.dtype)}
+
+
+class ExecutionAudit(TorchDispatchMode):
+    """Observe tensor boundaries in an extra forward, not CANN-internal arithmetic."""
+
+    def __init__(self):
+        super().__init__()
+        self.stage = "outside_stages"
+        self.operations = {}
+        self.stage_outputs = {}
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        result = func(*args, **kwargs)
+        inputs = [tensor_spec(t) for t in tree_flatten((args, kwargs))[0] if isinstance(t, torch.Tensor)]
+        outputs = [tensor_spec(t) for t in tree_flatten(result)[0] if isinstance(t, torch.Tensor)]
+        if inputs or outputs:
+            key = json.dumps((self.stage, str(func), inputs, outputs), sort_keys=True)
+            row = self.operations.setdefault(key, {
+                "stage": self.stage, "operator": str(func), "inputs": inputs, "outputs": outputs, "count": 0})
+            row["count"] += 1
+        return result
+
+    def report(self):
+        operations = list(self.operations.values())
+        return {
+            "scope": "extra untimed partitioned forward; PyTorch tensor boundaries, not CANN internals",
+            "stage_outputs": self.stage_outputs,
+            "operations": operations,
+            "npu_fp32_operations": [r for r in operations if any(
+                t["device"].startswith("npu") and t["dtype"] == "torch.float32"
+                for t in r["inputs"] + r["outputs"])],
+        }
+
+
+def probe_pooled_coordinates(model, data, direct_output):
+    from graspgenx.models.ptv3 import ptv3_vanilla
+
+    replaced = []
+    def replace_centroids(_module, _args, point):
+        replaced.append(tensor_spec(point.coord))
+        point.coord = torch.zeros_like(point.coord)
+
+    hooks = [module.register_forward_hook(replace_centroids) for module in model.modules()
+             if isinstance(module, ptv3_vanilla.VanillaSerializedPooling)]
+    try:
+        output = run_direct(model, data)
+    finally:
+        for hook in hooks:
+            hook.remove()
+    return {
+        "scope": "untimed diagnostic: zero pooled coordinates after each reduction; no production change",
+        "replaced_coordinate_reductions": replaced,
+        "vs_direct": compare(direct_output, output),
+        "embedding_bit_exact": bool(np.array_equal(direct_output, output)),
+        "caution": "intermediate coordinates deliberately differ; this does not validate removal for metadata consumers",
+    }
+
+
 def run_direct(model: torch.nn.Module, data: dict) -> np.ndarray:
     synchronize()
     with torch.inference_mode():
@@ -504,10 +580,13 @@ def run_partitioned(
     model: torch.nn.Module,
     data: dict,
     samples: dict[str, list[float]] | None = None,
+    audit: ExecutionAudit | None = None,
 ) -> np.ndarray:
     aggregate_ms = defaultdict(float)
 
     def stage(name, operation, aggregates=()):
+        if audit is not None:
+            audit.stage = name
         synchronize()
         started = time.perf_counter()
         try:
@@ -520,6 +599,14 @@ def run_partitioned(
             samples[name].append(elapsed_ms)
             for aggregate in aggregates:
                 aggregate_ms[aggregate] += elapsed_ms
+        if audit is not None:
+            if isinstance(value, torch.Tensor):
+                audit.stage_outputs[name] = {"output": tensor_spec(value)}
+            elif isinstance(value, dict):
+                audit.stage_outputs[name] = {key: tensor_spec(value[key]) for key in (
+                    "feat", "coord", "grid_coord", "batch", "offset", "_attention_residual")
+                    if key in value and isinstance(value[key], torch.Tensor)}
+            audit.stage = "outside_stages"
         return value
 
     total_started = time.perf_counter()
@@ -561,7 +648,7 @@ def run_partitioned(
             )
     pooled = stage(
         "6.global_mean_pooling",
-        lambda: segment_csr_vanilla(
+        lambda: model.pool_features(point) if hasattr(model, "pool_features") else segment_csr_vanilla(
             point.feat,
             F.pad(point.offset, (1, 0)),
             reduce="mean",
@@ -622,6 +709,8 @@ def write_report(report: dict) -> None:
 
 
 def main() -> int:
+    if RESULT_PATH.exists():
+        raise FileExistsError(f"refusing to overwrite existing profile: {RESULT_PATH}")
     report = {
         "contract": {
             "implementation": f"{IMPLEMENTATION}.{PointTransformerV3.__name__}",
@@ -633,6 +722,9 @@ def main() -> int:
             "shuffle_orders": SHUFFLE_ORDERS,
             "warmup_runs": WARMUP_RUNS,
             "profile_runs": PROFILE_RUNS,
+            "cpu_threads": CPU_THREADS,
+            "execution_audit": AUDIT_EXECUTION,
+            "coordinate_probe": PROBE_POOLED_COORDINATES,
             "gates": {"cosine": COSINE_GATE},
             "required_output": "matching shape and finite values",
             "report_only_metrics": ["max_abs", "mean_abs", "rmse", "relative_l2"],
@@ -643,6 +735,7 @@ def main() -> int:
             "result": str(RESULT_PATH),
         },
         "environment": {
+            "task_queue_enable": os.environ.get("TASK_QUEUE_ENABLE", "default"),
             "torch": torch.__version__,
             "torch_npu": (
                 getattr(torch_npu, "__version__", "unknown")
@@ -676,7 +769,13 @@ def main() -> int:
             })
             report["contract"]["execution"] = getattr(model, "execution_config", {})
             print(f"{encoder}: {report['contract']['parameter_layout']}", flush=True)
-            model_report = {}
+            model_report = {"tensor_inventory": {}}
+            for name, module in model.named_modules():
+                parameters = {key: tensor_spec(value) for key, value in module.named_parameters(recurse=False)}
+                buffers = {key: tensor_spec(value) for key, value in module.named_buffers(recurse=False)}
+                if parameters or buffers or name in ("embedding", "projection") or name.endswith(".down"):
+                    model_report["tensor_inventory"][name] = {
+                        "module": type(module).__name__, "parameters": parameters, "buffers": buffers}
             runtime_failed = False
             try:
                 # Run explicit stages first so unsupported operations are
@@ -691,6 +790,8 @@ def main() -> int:
                     partitioned_output = run_partitioned(
                         model, data, samples
                     )
+                    if USE_CUDA_GOLDEN and not compare(golden[f"{encoder}_embedding"], partitioned_output)["passed"]:
+                        raise RuntimeError(f"invalid profiled output at run {run_index + 1}")
                     print(
                         f"  staged run {run_index + 1}/{PROFILE_RUNS}", flush=True
                     )
@@ -727,6 +828,20 @@ def main() -> int:
                         )
                     )
                 )
+                if AUDIT_EXECUTION:
+                    audit = ExecutionAudit()
+                    with audit:
+                        audited_output = run_partitioned(model, data, audit=audit)
+                    model_report["execution_audit"] = audit.report()
+                    model_report["execution_audit"]["vs_direct"] = compare(direct_output, audited_output)
+                    model_report["passed"] &= model_report["execution_audit"]["vs_direct"]["passed"]
+                    print(f"  untimed audit: {len(audit.operations)} operator signatures, "
+                          f"{len(model_report['execution_audit']['npu_fp32_operations'])} with NPU FP32 tensors", flush=True)
+                if PROBE_POOLED_COORDINATES:
+                    model_report["coordinate_probe"] = probe_pooled_coordinates(model, data, direct_output)
+                    probe = model_report["coordinate_probe"]
+                    print(f"  coordinate probe: {len(probe['replaced_coordinate_reductions'])} means replaced; "
+                          f"embedding bit-exact={probe['embedding_bit_exact']}", flush=True)
                 status = "PASS" if model_report["passed"] else "FAIL"
                 print(f"[{status}] {encoder}", flush=True)
                 for stage_name, timing in model_report["stage_timings"].items():

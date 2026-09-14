@@ -11,3 +11,5 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh || return
 source ascend/custom_ops/submconv3d/env.sh
 source ascend/custom_ops/grid_encode/env.sh || return
 export PYTHONPATH="$(dirname -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")")${PYTHONPATH:+:$PYTHONPATH}"
+# Set before importing Torch-NPU; explicit benchmark controls may keep level 1.
+export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-2}"

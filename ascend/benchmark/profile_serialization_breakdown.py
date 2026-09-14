@@ -33,7 +33,7 @@ PROCESS_RUNS, WARMUP_RUNS, MEASURED_RUNS = 3, 3, 20
 CPU_THREADS = 16
 
 sys.path.insert(0, str(REPO_ROOT))
-from ascend.tools import validate_ptv3 as validation
+from ascend.benchmark import validate_ptv3 as validation
 from graspgenx.models.ptv3 import ptv3_vanilla as reference
 
 

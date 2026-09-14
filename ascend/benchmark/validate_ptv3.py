@@ -10,7 +10,7 @@ Run from the GraspGenX repository after loading CANN::
 
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
     export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-    python3 ascend/tools/validate_ptv3.py
+    python3 ascend/benchmark/validate_ptv3.py
 
 The following files must exist under ``BASELINE_DIR``::
 
@@ -58,13 +58,13 @@ except ImportError:  # CPU baseline remains usable without torch-npu
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BASELINE_DIR = REPO_ROOT / "ascend/baselines/ptv3-cuda-fp32-eager"
 RESULT_DIR = REPO_ROOT / "ascend/results"
-EXPERIMENT_TAG = "grid_encode_four_orders"
+EXPERIMENT_TAG = f"performance_{time.strftime('%Y%m%d_%H%M%S')}"
 POINT_COUNTS = (64, 2048, 3500)
 ENCODERS = ("generator", "discriminator")
 WARMUP_RUNS = 3
 MEASURED_RUNS = 20
 REPEAT_CHECKS = 3
-CPU_THREADS = 16
+CPU_THREADS = 14
 
 GRID_SIZE = 0.01
 OUTPUT_DIM = 512
@@ -75,6 +75,7 @@ SHUFFLE_ORDERS = False
 # diagnostic; wrong shapes, non-finite outputs and runtime errors remain invalid.
 COSINE_GATE = 0.9999
 PER_ENCODER_TARGET_MS = 150.0
+COMBINED_TARGET_MS = 200.0
 
 WEIGHT_FILES = {
     "generator": "generator_ptv3_state.pth",
@@ -354,6 +355,8 @@ def print_encoder_totals(results: list[dict]) -> list[dict]:
             "point_count": point_count,
             "mean_ms_sum": mean_sum,
             "median_ms_sum": median_sum,
+            "combined_target_ms": COMBINED_TARGET_MS,
+            "combined_target_passed": median_sum <= COMBINED_TARGET_MS,
         })
         print(
             f"{point_count:6d} {generator['mean_ms']:10.3f} "
@@ -398,6 +401,7 @@ def main() -> int:
         },
         "baseline_sha256": {},
         "environment": {
+            "task_queue_enable": os.environ.get("TASK_QUEUE_ENABLE", "default"),
             "torch": torch.__version__,
             "torch_npu": (
                 getattr(torch_npu, "__version__", "unknown")
@@ -498,6 +502,9 @@ def main() -> int:
     print(f"ACCURACY: {report['summary']['correctness']}", flush=True)
     print(f"PERFORMANCE TARGET (report only): {report['summary']['performance_target']}", flush=True)
     report["latency_totals"] = print_encoder_totals(report["results"])
+    combined_passed = len(report["latency_totals"]) == len(POINT_COUNTS) and all(row["combined_target_passed"] for row in report["latency_totals"])
+    report["summary"]["combined_performance_target"] = "PASS" if combined_passed else "FAIL"
+    print(f"G+D MEDIAN-SUM TARGET <= {COMBINED_TARGET_MS:g} ms (report only): {report['summary']['combined_performance_target']}", flush=True)
     write_report(report)
     print(f"Report: {RESULT_PATH}", flush=True)
     return 0 if correctness_passed else 1

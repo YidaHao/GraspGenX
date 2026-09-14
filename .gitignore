@@ -45,4 +45,5 @@ end2end/runs/
 /ascend/results/
 /ascend/graspgenx_*.md
 /ascend/*_profile.md
+/ascend/Performance_*.md
 /fusion_result.json

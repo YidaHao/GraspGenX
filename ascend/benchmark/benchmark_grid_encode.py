@@ -2,7 +2,7 @@
 """Paired serialization-only ablation of the current Ascend encoder.
 
 Run on P1 after sourcing the existing SubM and then GridEncode env.sh files:
-    python3 -B ascend/tools/benchmark_grid_encode.py
+    python3 -B ascend/benchmark/benchmark_grid_encode.py
 Requires model.forward and profile.serialize_point to call model.serialize_point.
 No builds, alternate CPE, rescaling, golden writes, or implementation CLI.
 """
@@ -312,7 +312,7 @@ if __name__ == "__main__":
         import torch
         import torch_npu
         sys.path.insert(0, str(REPO_ROOT))
-        from ascend.tools import validate_ptv3 as validation, profile_ptv3_stages as profiler
+        from ascend.benchmark import validate_ptv3 as validation, profile_ptv3_stages as profiler
         from graspgenx.models.ptv3.ptv3_ascend import PointTransformerV3Ascend, NPU_DEVICE
         from graspgenx.models.ptv3.ptv3_vanilla import VanillaPoint, encode
         from ascend.custom_ops.grid_encode.grid_encode import grid_encode

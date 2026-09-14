@@ -16,12 +16,12 @@ from unittest.mock import patch
 
 import torch
 
-from ascend.tools.validate_ptv3 import install_minimal_import_shims
+from ascend.benchmark.validate_ptv3 import install_minimal_import_shims
 
 install_minimal_import_shims()
 
 from graspgenx.models.ptv3.ptv3_ascend import (
-    AscendBlock, CachedCPEConv, NPU_DEVICE, NPU_JIT_COMPILE, SubMCPEConv,
+    CachedCPEConv, NPU_DEVICE, NPU_JIT_COMPILE, SubMCPEConv,
 )
 from graspgenx.models.ptv3.ptv3_vanilla import (
     HashSparseConv3d, PointTransformerV3Vanilla, VanillaBlock,
@@ -252,6 +252,11 @@ class CachedCPETests(unittest.TestCase):
             self.compare(output, HashSparseConv3d.forward(module, feat, grid, batch), "model_cpe")
             caches.append(cache)
 
+        def geometry_cpe(block, point):
+            cpe = block.cpe_conv(point.feat, point.grid_coord, point.batch, point)
+            point.feat = point.feat + block.cpe_norm(block.cpe_linear(cpe))
+            return point
+
         for stage in model.enc:
             for block in stage.children():
                 if isinstance(block, VanillaBlock):
@@ -264,9 +269,9 @@ class CachedCPETests(unittest.TestCase):
         grid[:, 0] = torch.arange(17)
         data = dict(grid_coord=grid, coord=grid.float(), feat=torch.randn(17, 3),
                     offset=torch.tensor([17]))
-        # Exercise real point creation and pooling, using the production CPE body
-        # only. Attention/FFN placement and full-encoder acceptance are out of scope.
-        with patch.object(VanillaBlock, "forward", AscendBlock.forward_cpe):
+        # Exercise real point creation/pooling with original CPU post-ops only.
+        # Actual FP16 block boundaries are covered by test_cpe_postops.py.
+        with patch.object(VanillaBlock, "forward", geometry_cpe):
             for version in range(3):
                 data["feat"].copy_(torch.randn_like(data["feat"]))
                 if version == 2:

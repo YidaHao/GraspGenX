@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Same-host, paired full-encoder comparison; no implementation/device CLI flags."""
+"""Paired CPE conv/map ablation with benchmark-only CPU FP32 CPE post-ops.
+
+All variants keep current serialization and FFN; none uses default FP16 CPE
+post-ops. No implementation/device CLI flags.
+"""
 
 import json
 import os
 from collections import defaultdict
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 import subprocess
@@ -11,6 +16,7 @@ import sys
 import time
 import traceback
 from types import MethodType
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -31,8 +37,9 @@ BENCHMARK_HOST = "192.168.7.101"
 BENCHMARK_DEVICE = "Ascend310P1"
 
 sys.path.insert(0, str(REPO_ROOT))
-from ascend.tools import validate_ptv3 as validation
-from ascend.tools import profile_ptv3_stages as profiler
+from ascend.benchmark import validate_ptv3 as validation
+from ascend.benchmark import profile_ptv3_stages as profiler
+from ascend.benchmark.benchmark_cpe_postops import cpu_cpe_control
 from graspgenx.models.ptv3.ptv3_ascend import (
     PointTransformerV3Ascend,
     CachedCPEConv,
@@ -59,18 +66,21 @@ def cpu_map_control(conv, grid, batch, point):
     return cache["npu"]
 
 
-def model_from_weights(state, variant):
+def model_from_weights(state, variant, controls):
     model = PointTransformerV3Ascend(in_channels=3, output_dim=512, grid_size=0.01,
                                    enable_flash=False, shuffle_orders=False)
     model.load_state_dict(state, strict=True)
+    for stage in model.enc:
+        for block in stage.children():
+            if hasattr(block, "attn"):
+                controls.enter_context(patch.object(block, "forward_cpe", MethodType(cpu_cpe_control, block)))
+                if variant == "current":
+                    block.cpe_conv = CachedCPEConv(block.cpe_conv)
+                elif variant == "npu_subm":
+                    controls.enter_context(patch.object(
+                        block.cpe_conv, "_get_npu_map", MethodType(cpu_map_control, block.cpe_conv)))
+    model.execution_config["cpe_post_ops"] = "cpu_fp32_benchmark_control"
     if variant != "mixed_subm":
-        for stage in model.enc:
-            for block in stage.children():
-                if hasattr(block, "attn"):
-                    if variant == "current":
-                        block.cpe_conv = CachedCPEConv(block.cpe_conv)
-                    else:
-                        block.cpe_conv._get_npu_map = MethodType(cpu_map_control, block.cpe_conv)
         model.execution_config["cpe_map"] = "cpu_full_map"
         if variant == "current":
             model.execution_config["cpe_compute"] = "cpu_fp32"
@@ -110,11 +120,12 @@ def run_round(index, destination):
     torch.manual_seed(0)
     report = {"round": index, "pid": os.getpid(), "results": [], "failures": []}
     report_path = destination / f"round_{index}.json"
+    controls = ExitStack()
     try:
         for encoder in ENCODERS:
             state = torch.load(BASELINE_DIR / validation.WEIGHT_FILES[encoder],
                                map_location="cpu", weights_only=False)["model"]
-            models = {name: model_from_weights(state, name) for name in VARIANTS}
+            models = {name: model_from_weights(state, name, controls) for name in VARIANTS}
             report["execution_configs"] = {name: model.execution_config for name, model in models.items()}
             del state
             for count in POINT_COUNTS:
@@ -188,6 +199,7 @@ def run_round(index, destination):
                             "stage_samples_ms": dict(stage_samples),
                         }
                         write_json(report_path, report)
+            controls.close()  # Restore class lookup and break bound-method self-cycles.
             del models, outputs
             torch.npu.empty_cache()
         report["completed"] = True
@@ -196,6 +208,7 @@ def run_round(index, destination):
         print(traceback.format_exc(), flush=True)
         raise
     finally:
+        controls.close()
         write_json(report_path, report)
 
 
@@ -209,7 +222,9 @@ def main():
                      "process_runs": PROCESS_RUNS, "warmup": WARMUP_RUNS,
                      "measured_runs": MEASURED_RUNS, "repeat_checks": REPEAT_CHECKS,
                      "cpu_threads": CPU_THREADS, "cosine_gate": validation.COSINE_GATE,
-                      "scope": "encoder-only; maps rebuilt once/stage/forward; all transfers included",
+                       "scope": "encoder-only conv/map ablation; CPU FP32 CPE post-ops in ALL variants; maps rebuilt once/stage/forward; all transfers included",
+                       "cpe_post_ops": "cpu_fp32_benchmark_control",
+                       "unchanged": "current serialization/GridEncode, attention and FFN including CPU FP32 FFN exit",
                       "reference": "benchmark-only cached CPU CPE (not the historical uncached control)",
                       "order": "cyclic variant rotation in each process", "profile_runs": PROFILE_RUNS},
         "environment": {"host": BENCHMARK_HOST, "device": BENCHMARK_DEVICE,
@@ -217,6 +232,7 @@ def main():
                         "cann": os.environ.get("ASCEND_HOME_PATH")},
         "sources": {str(p.relative_to(REPO_ROOT)): validation.sha256_file(p) for p in (
             Path(__file__), REPO_ROOT / "graspgenx/models/ptv3/ptv3_ascend.py",
+            Path(cpu_cpe_control.__code__.co_filename).resolve(),
             REPO_ROOT / "graspgenx/models/ptv3/ptv3_vanilla.py",
             REPO_ROOT / "ascend/custom_ops/submconv3d/op_kernel/subm_conv3d.cpp",
             REPO_ROOT / "ascend/custom_ops/submconv3d/op_host/subm_conv3d.cpp",
