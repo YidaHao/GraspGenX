@@ -49,6 +49,9 @@ import types
 from collections import defaultdict
 from pathlib import Path
 
+# Configure before Torch imports; preserve explicit environment overrides.
+os.environ.setdefault("TASK_QUEUE_ENABLE", "2")
+
 import numpy as np
 import torch
 import torch.nn.functional as F
