@@ -74,7 +74,6 @@ USE_CUDA_GOLDEN = True
 ENCODERS = ("generator", "discriminator")
 WARMUP_RUNS = 3
 PROFILE_RUNS = 20
-CPU_THREADS = 14
 RANKING_TABLE_LIMIT = 100
 AUDIT_EXECUTION = True  # Separate, untimed forward; never included in stage samples.
 PROBE_POOLED_COORDINATES = True  # Diagnostic perturbation, not an optimization.
@@ -722,7 +721,7 @@ def main() -> int:
             "shuffle_orders": SHUFFLE_ORDERS,
             "warmup_runs": WARMUP_RUNS,
             "profile_runs": PROFILE_RUNS,
-            "cpu_threads": CPU_THREADS,
+            "cpu_threads": torch.get_num_threads(),
             "execution_audit": AUDIT_EXECUTION,
             "coordinate_probe": PROBE_POOLED_COORDINATES,
             "gates": {"cosine": COSINE_GATE},
@@ -758,7 +757,6 @@ def main() -> int:
     )
 
     try:
-        torch.set_num_threads(CPU_THREADS)
         data, golden = load_input()
 
         for encoder in ENCODERS:

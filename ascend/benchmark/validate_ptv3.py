@@ -64,7 +64,6 @@ ENCODERS = ("generator", "discriminator")
 WARMUP_RUNS = 3
 MEASURED_RUNS = 20
 REPEAT_CHECKS = 3
-CPU_THREADS = 14
 
 GRID_SIZE = 0.01
 OUTPUT_DIM = 512
@@ -380,6 +379,7 @@ def main() -> int:
             "warmup_runs": WARMUP_RUNS,
             "measured_runs": MEASURED_RUNS,
             "repeat_checks": REPEAT_CHECKS,
+            "cpu_threads": torch.get_num_threads(),
             "gates": {
                 "cosine": COSINE_GATE,
             },
@@ -434,7 +434,6 @@ def main() -> int:
                     f"SHA-256 mismatch for {filename}: expected {expected}, got {actual}"
                 )
 
-        torch.set_num_threads(CPU_THREADS)
         torch.manual_seed(0)
         for encoder in ENCODERS:
             model = make_model(encoder)
