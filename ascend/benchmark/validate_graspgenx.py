@@ -5,7 +5,9 @@ Run on 310P1 after `source ascend/env.sh`. Required cuda_baselines.npz and
 cuda_baselines.json must exist in GOLDEN_DIR (alongside the preserved golden).
 Cosine and all error metrics are report-only. Exit 1 means invalid output or a
 runtime failure, not a numerical difference. There are no CLI args.
-Switch only the direct PTV3 import to run a CPU vanilla control.
+Switch generator and PTV3 independently using the direct imports below. The
+Ascend generator reuses likelihood scales; the reference generator is unchanged.
+There are no inference optimization toggles.
 """
 
 from __future__ import annotations
@@ -28,11 +30,14 @@ from graspgenx_baseline_common import (
 from graspgenx.models.ptv3.ptv3_ascend import PointTransformerV3Ascend as PointTransformerV3
 # from graspgenx.models.ptv3.ptv3_vanilla import PointTransformerV3Vanilla as PointTransformerV3
 
+from graspgenx.models.generator_ascend import GraspGenGeneratorAscend as Generator
+# from graspgenx.models.generator import GraspGenGenerator as Generator
+
 
 CHECKPOINT_ROOT = REPO_ROOT / "ascend/release"
 GOLDEN_DIR = REPO_ROOT / "ascend/baselines/graspgenx-cuda-reference-2048-v1"
 RESULT_DIR = REPO_ROOT / "ascend/results"
-RESULT_PATH = RESULT_DIR / f"graspgenx_{PointTransformerV3.__module__.rsplit('.', 1)[-1]}_{time.strftime('%Y%m%d_%H%M%S')}_validation.json"
+RESULT_PATH = RESULT_DIR / f"graspgenx_{Generator.__module__.rsplit('.', 1)[-1]}_{PointTransformerV3.__module__.rsplit('.', 1)[-1]}_{time.strftime('%Y%m%d_%H%M%S')}_validation.json"
 OUTPUT_PATH = RESULT_PATH.with_suffix(".npz")
 
 WARMUP_RUNS = 3
@@ -44,8 +49,10 @@ def main():
     torch.set_num_threads(CPU_THREADS)
     request, baselines, metadata = load_cuda_baselines(GOLDEN_DIR)
     model, cfg, device, acceleration = build_model(
-        CHECKPOINT_ROOT, "npu", encoder_class=PointTransformerV3
+        CHECKPOINT_ROOT, "npu", encoder_class=PointTransformerV3,
+        generator_class=Generator,
     )
+    print(f"Generator: {type(model.grasp_generator).__module__}.{type(model.grasp_generator).__name__}", flush=True)
     pipeline = Pipeline(model, request, device)
     samples, timings = run_timed(pipeline, WARMUP_RUNS, MEASURED_RUNS)
     outputs, traces = pipeline.run(record=True)
@@ -57,6 +64,7 @@ def main():
     np.savez(OUTPUT_PATH, **candidate)
     report = {
         "implementation": f"{PointTransformerV3.__module__}.{PointTransformerV3.__name__}",
+        "generator_implementation": f"{type(model.grasp_generator).__module__}.{type(model.grasp_generator).__name__}",
         "runtime": "npu",
         "torch": torch.__version__,
         "torch_npu": version("torch-npu"),

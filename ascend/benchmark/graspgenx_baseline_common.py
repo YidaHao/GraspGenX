@@ -230,6 +230,7 @@ def build_model(
     encoder_class=None,
     cuda_acceleration: str = "native",
     cuda_ptv3_flash: bool = True,
+    generator_class=None,
 ):
     device = torch.device("cuda:0" if runtime == "cuda" else "npu:0")
     if runtime == "npu":
@@ -240,7 +241,9 @@ def build_model(
         raise RuntimeError("CUDA is unavailable")
 
     cfg = load_config(checkpoint_root, runtime, cuda_ptv3_flash)
-    model = GraspGen.from_config(cfg.diffusion, cfg.discriminator)
+    # Omitting a class keeps upstream CUDA checkouts on their original factory.
+    factory_kwargs = {} if generator_class is None else {"generator_class": generator_class}
+    model = GraspGen.from_config(cfg.diffusion, cfg.discriminator, **factory_kwargs)
     model.load_state_dict(cfg.eval.gen_checkpoint, cfg.eval.dis_checkpoint)
     model.grasp_generator.num_grasps_per_object = 100
 
@@ -381,13 +384,23 @@ class StageTimer:
             "generator.scheduler_position": diffusion_steps,
             "generator.scheduler_rotation": diffusion_steps,
             "generator.pose_conversion": diffusion_steps,
-            "generator.likelihood_log_prob": 2 * (diffusion_steps - 1),
             "discriminator.ptv3": 1,
             "discriminator.pose_conversion": 1,
             "discriminator.sample_encoder": 1,
             "discriminator.gripper_encoder": 1,
             "discriminator.prediction_head": 1,
         }
+        if "generator.likelihood" in self.samples:
+            specifications.update({
+                "generator.likelihood": 2 * (diffusion_steps - 1),
+                "generator.likelihood_accumulate": diffusion_steps - 1,
+                "generator.likelihood_setup": 2,
+                "generator.history_allocate": 1,
+                "generator.history_write": diffusion_steps,
+            })
+        else:
+            # The upstream CUDA checkout may predate the inference helpers.
+            specifications["generator.likelihood_log_prob"] = 2 * (diffusion_steps - 1)
         for name, calls_per_request in specifications.items():
             samples = self.samples.get(name, [])
             expected = runs * calls_per_request
@@ -432,13 +445,24 @@ class TimedModule(torch.nn.Module):
 
 
 @contextmanager
-def install_function_timers(timer: StageTimer):
+def install_function_timers(timer: StageTimer, model=None):
     import graspgenx.models.discriminator as discriminator_module
     import graspgenx.models.generator as generator_module
 
+    generator = model.grasp_generator if model is not None else None
+    if generator is not None:
+        # Patch the globals actually used by the selected inference function.
+        generator_module = sys.modules[generator.forward_inference.__module__]
     original_rt_to_matrix = generator_module.rt_to_matrix
     original_matrix_to_rt = discriminator_module.matrix_to_rt
     original_log_prob = torch.distributions.Normal.log_prob
+    patched_methods = []
+
+    def timed_method(method, name):
+        def call(*args, **kwargs):
+            with timer.section(name):
+                return method(*args, **kwargs)
+        return call
 
     def rt_to_matrix(*args, **kwargs):
         with timer.section("generator.pose_conversion"):
@@ -454,13 +478,31 @@ def install_function_timers(timer: StageTimer):
 
     generator_module.rt_to_matrix = rt_to_matrix
     discriminator_module.matrix_to_rt = matrix_to_rt
-    torch.distributions.Normal.log_prob = log_prob
+    if generator is not None and hasattr(generator, "_inference_likelihood"):
+        for method_name, stage_name in (
+            ("_prepare_likelihood_scales", "generator.likelihood_setup"),
+            ("_inference_likelihood", "generator.likelihood"),
+            ("_accumulate_inference_likelihood", "generator.likelihood_accumulate"),
+            ("_allocate_inference_history", "generator.history_allocate"),
+            ("_write_inference_history", "generator.history_write"),
+        ):
+            method = getattr(generator, method_name)
+            # Remove the instance override on exit when the method was inherited.
+            patched_methods.append((method_name, generator.__dict__.get(method_name)))
+            setattr(generator, method_name, timed_method(method, stage_name))
+    else:
+        torch.distributions.Normal.log_prob = log_prob
     try:
         yield
     finally:
         generator_module.rt_to_matrix = original_rt_to_matrix
         discriminator_module.matrix_to_rt = original_matrix_to_rt
         torch.distributions.Normal.log_prob = original_log_prob
+        for name, original in patched_methods:
+            if original is None:
+                delattr(generator, name)
+            else:
+                setattr(generator, name, original)
 
 
 class ReplayScheduler:
@@ -763,6 +805,7 @@ def compare_outputs(reference: dict, candidate: dict) -> dict:
         "logits": (reference["logits"], candidate["logits"]),
         "confidence": (reference["confidence"], candidate["confidence"]),
         "likelihood": (reference["likelihood"], candidate["likelihood"]),
+        "grasps_per_iteration": (reference["grasps_per_iteration"], candidate["grasps_per_iteration"]),
     }
     report = {name: compare_array(*arrays) for name, arrays in components.items()}
     report["noise_prediction_steps"] = [

@@ -42,13 +42,15 @@ class GraspGen(nn.Module):
     Args:
         grasp_generator_cfg (DictConfig): Configuration for the grasp generator
         grasp_discriminator_cfg (DictConfig): Configuration for the grasp discriminator
+        generator_class: Generator type; defaults to the reference implementation.
     """
 
     def __init__(
-        self, grasp_generator_cfg: DictConfig, grasp_discriminator_cfg: DictConfig
+        self, grasp_generator_cfg: DictConfig, grasp_discriminator_cfg: DictConfig,
+        generator_class=GraspGenGenerator,
     ):
         super(GraspGen, self).__init__()
-        self.grasp_generator = GraspGenGenerator.from_config(grasp_generator_cfg)
+        self.grasp_generator = generator_class.from_config(grasp_generator_cfg)
         self.grasp_discriminator = GraspGenDiscriminator.from_config(
             grasp_discriminator_cfg
         )
@@ -84,18 +86,20 @@ class GraspGen(nn.Module):
 
     @classmethod
     def from_config(
-        cls, grasp_generator_cfg: DictConfig, grasp_discriminator_cfg: DictConfig
+        cls, grasp_generator_cfg: DictConfig, grasp_discriminator_cfg: DictConfig,
+        generator_class=GraspGenGenerator,
     ):
         """Creates a GraspGen instance from configuration objects.
 
         Args:
             grasp_generator_cfg (DictConfig): Configuration for the grasp generator
             grasp_discriminator_cfg (DictConfig): Configuration for the grasp discriminator
+            generator_class: Explicit generator type for experimental inference.
 
         Returns:
             GraspGen: Instantiated model
         """
-        return GraspGen(grasp_generator_cfg, grasp_discriminator_cfg)
+        return cls(grasp_generator_cfg, grasp_discriminator_cfg, generator_class=generator_class)
 
     def load_state_dict(
         self, grasp_generator_ckpt_filepath: str, grasp_discriminator_ckpt_filepath: str
